@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-data-search"
+version = "0.1.0"
+description = "A small transactional local data retrieval engine"
+requires-python = ">=3.10"
+
+[project.scripts]
+local-search = "local_search.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["local_search*"]

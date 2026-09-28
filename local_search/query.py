@@ -1,0 +1,79 @@
+from dataclasses import dataclass
+from typing import List, Optional
+
+from .analysis import tokenize
+
+
+@dataclass(frozen=True)
+class Clause:
+    field: Optional[str]
+    phrase: bool
+    terms: List[str]
+    raw: str
+
+
+@dataclass(frozen=True)
+class Query:
+    clauses: List[Clause]
+
+
+def _read_quoted(text: str, start: int) -> tuple[str, int]:
+    end = start + 1
+    escaped = False
+    output = []
+    while end < len(text):
+        char = text[end]
+        if escaped:
+            output.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            return "".join(output), end + 1
+        else:
+            output.append(char)
+        end += 1
+    raise ValueError("Unterminated quoted phrase")
+
+
+def parse_query(text: str) -> Query:
+    clauses = []
+    position = 0
+    while position < len(text):
+        while position < len(text) and text[position].isspace():
+            position += 1
+        if position >= len(text):
+            break
+
+        start = position
+        field = None
+        while position < len(text) and (text[position].isalnum() or text[position] in "_"):
+            position += 1
+        if position < len(text) and text[position] == ":" and position > start:
+            field = text[start:position]
+            position += 1
+        else:
+            position = start
+
+        if position < len(text) and text[position] == '"':
+            phrase_text, position = _read_quoted(text, position)
+            terms = tokenize(phrase_text)
+            if not terms:
+                raise ValueError("Empty phrase is not supported")
+            clauses.append(Clause(field, True, terms, text[start:position]))
+        else:
+            word_start = position
+            while position < len(text) and not text[position].isspace():
+                position += 1
+            word = text[word_start:position]
+            if not word:
+                raise ValueError("Malformed query")
+            terms = tokenize(word)
+            if not terms:
+                position += 1
+                continue
+            clauses.append(Clause(field, False, terms, word))
+
+    if not clauses:
+        raise ValueError("Empty query")
+    return Query(clauses)
