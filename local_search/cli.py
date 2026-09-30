@@ -1,8 +1,20 @@
 import argparse
 import json
-from typing import Sequence
+import sys
+from typing import Optional, Sequence
 
 from .engine import SearchEngine
+
+
+def _allow_leading_dash(argv: Optional[Sequence[str]]) -> list[str]:
+    """Let query strings starting with '-' (exclusion clauses) parse as values."""
+    values = list(sys.argv[1:]) if argv is None else list(argv)
+    for command in ("search", "snapshot-search"):
+        if command in values and "--" not in values:
+            index = values.index(command) + 1
+            if index < len(values) and values[index].startswith("-"):
+                return values[:index] + ["--"] + values[index:]
+    return values
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -29,7 +41,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     snapshot_search.add_argument("query")
     snapshot_search.add_argument("--limit", type=int)
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(_allow_leading_dash(argv))
     engine = SearchEngine(args.index)
 
     if args.command == "upsert":

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .analysis import tokenize
 
@@ -50,6 +50,13 @@ class SynonymRules:
     def candidates(self, term: str) -> Tuple[str, ...]:
         alternatives = self.alternatives(term)
         return (term, *alternatives)
+
+    def group_for(self, term: str, synonym: str) -> Optional[Tuple[str, ...]]:
+        """Return the concrete synonym group justifying term -> synonym."""
+        for group in self._index.get(term, ()):
+            if synonym in group:
+                return group
+        return None
 
     def to_payload(self) -> Dict[str, object]:
         return {"version": self.version, "groups": [list(group) for group in self.groups]}

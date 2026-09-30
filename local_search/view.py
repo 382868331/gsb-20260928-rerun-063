@@ -10,13 +10,21 @@ from .synonyms import SynonymRules
 class TermHit:
     term: str
     matched_as: str
+    position: int
+    synonym_group: Optional[Tuple[str, ...]] = None
 
     @property
     def kind(self) -> str:
         return "original" if self.matched_as == self.term else "synonym"
 
     def to_dict(self) -> Dict[str, object]:
-        return {"term": self.term, "matched_as": self.matched_as, "kind": self.kind}
+        return {
+            "term": self.term,
+            "matched_as": self.matched_as,
+            "kind": self.kind,
+            "position": self.position,
+            "synonym_group": list(self.synonym_group) if self.synonym_group else None,
+        }
 
 
 @dataclass
@@ -27,6 +35,8 @@ class ClauseHit:
 
     @property
     def mode(self) -> str:
+        if self.clause.negated:
+            return "excluded"
         if not self.clause.expand:
             return "strict"
         return "expanded_phrase" if self.clause.phrase else "expanded_terms"
@@ -37,6 +47,8 @@ class ClauseHit:
             "field": self.clause.field,
             "phrase": self.clause.phrase,
             "expand": self.clause.expand,
+            "negated": self.clause.negated,
+            "slop": self.clause.slop,
             "mode": self.mode,
             "matched_field": self.field_name,
             "terms": [hit.to_dict() for hit in self.terms],
@@ -47,6 +59,7 @@ class ClauseHit:
 class DocumentMatch:
     document: StoredDocument
     clause_hits: List[ClauseHit] = field(default_factory=list)
+    excluded_clauses: List[str] = field(default_factory=list)
 
     def matched_tokens(self) -> List[str]:
         tokens: List[str] = []
@@ -55,17 +68,30 @@ class DocumentMatch:
                 tokens.append(term_hit.matched_as)
         return tokens
 
-    def explanation(self, score: float, term_contributions: Optional[Dict[str, object]] = None, rules_version: Optional[int] = None) -> Dict[str, object]:
+    def explanation(
+        self,
+        score: float,
+        term_contributions: Optional[Dict[str, object]] = None,
+        rules_version: Optional[int] = None,
+    ) -> Dict[str, object]:
         terms: Dict[str, Dict[str, object]] = {}
         for clause_hit in self.clause_hits:
             for term_hit in clause_hit.terms:
                 entry = terms.setdefault(
                     term_hit.term,
-                    {"term": term_hit.term, "matched_as": term_hit.matched_as, "kind": term_hit.kind, "occurrences": 0},
+                    {
+                        "term": term_hit.term,
+                        "matched_as": term_hit.matched_as,
+                        "kind": term_hit.kind,
+                        "occurrences": 0,
+                        "positions": [],
+                        "synonym_group": term_hit.synonym_group,
+                    },
                 )
                 entry["occurrences"] = int(entry["occurrences"]) + 1
-                if entry["kind"] == "original":
-                    entry["matched_as"] = term_hit.matched_as
+                entry["positions"].append(term_hit.position)
+                if term_hit.synonym_group is not None:
+                    entry["synonym_group"] = list(term_hit.synonym_group)
                 if term_contributions and term_hit.matched_as in term_contributions:
                     entry["score_contribution"] = term_contributions[term_hit.matched_as].get("contribution")
                     entry["matched_term_frequency"] = term_contributions[term_hit.matched_as].get("document_frequency")
@@ -73,6 +99,7 @@ class DocumentMatch:
             "score": score,
             "synonym_version": rules_version,
             "clauses": [hit.to_dict() for hit in self.clause_hits],
+            "exclusions": list(self.excluded_clauses),
             "terms": list(terms.values()),
         }
 
@@ -104,7 +131,13 @@ class SearchView:
         self.rules = rules
 
     @classmethod
-    def live(cls, segments: List[Segment], sequences: Dict[str, int], deletes: Dict[str, int], rules: SynonymRules) -> "SearchView":
+    def live(
+        cls,
+        segments: List[Segment],
+        sequences: Dict[str, int],
+        deletes: Dict[str, int],
+        rules: SynonymRules,
+    ) -> "SearchView":
         entries = [_SegmentEntry(segment, sequences[segment.segment_id]) for segment in segments]
         visible: Dict[str, StoredDocument] = {}
         newest: Dict[str, int] = {}
@@ -118,9 +151,16 @@ class SearchView:
         return cls(visible, entries, newest, rules)
 
     def run(self, query: Query) -> Dict[str, DocumentMatch]:
+        rules = query.rules or self.rules
         matches: Dict[str, DocumentMatch] = {doc_id: DocumentMatch(doc) for doc_id, doc in self.documents.items()}
         for clause in query.clauses:
-            clause_matches = self._match_clause(clause, query.rules or self.rules)
+            clause_matches = self._match_clause(clause, rules)
+            if clause.negated:
+                for doc_id in clause_matches:
+                    matches.pop(doc_id, None)
+                for match in matches.values():
+                    match.excluded_clauses.append(clause.raw)
+                continue
             for doc_id in list(matches):
                 hit = clause_matches.get(doc_id)
                 if hit is None:
@@ -132,16 +172,26 @@ class SearchView:
     def _match_clause(self, clause: Clause, rules: SynonymRules) -> Dict[str, ClauseHit]:
         result: Dict[str, ClauseHit] = {}
         for entry in self.entries:
-            field_names = [clause.field] if clause.field is not None else list(entry.segment.postings)
-            for field_name in field_names:
-                term_postings = entry.segment.postings.get(field_name, {})
-                for doc_id in self._field_docs(term_postings, clause, rules):
-                    if self.newest.get(doc_id) != entry.sequence or doc_id in result:
+            field_names = [clause.field] if clause.field is not None else sorted(entry.segment.postings)
+            for doc_id, doc in entry.segment.documents.items():
+                if self.newest.get(doc_id) != entry.sequence or doc_id in result:
+                    continue
+                best: Optional[ClauseHit] = None
+                for field_name in field_names:
+                    term_postings = entry.segment.postings.get(field_name, {})
+                    if doc_id not in self._field_docs(term_postings, clause, rules):
                         continue
                     hit = self._field_hit(field_name, term_postings, clause, doc_id, rules)
-                    if hit is not None:
-                        result[doc_id] = hit
+                    if hit is not None and (best is None or self._chain_rank(hit) < self._chain_rank(best)):
+                        best = hit
+                if best is not None:
+                    result[doc_id] = best
         return result
+
+    def _chain_rank(self, hit: ClauseHit) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
+        kinds = tuple(0 if term.kind == "original" else 1 for term in hit.terms)
+        positions = tuple(term.position for term in hit.terms)
+        return (kinds, positions, positions[-1] - positions[0])
 
     def _field_docs(
         self,
@@ -149,12 +199,14 @@ class SearchView:
         clause: Clause,
         rules: SynonymRules,
     ) -> List[str]:
-        first = clause.terms[0]
-        candidates = set(term_postings.get(first, {}))
-        if clause.expand:
-            for synonym in rules.alternatives(first):
-                candidates.update(term_postings.get(synonym, {}))
-        return list(candidates)
+        candidate_sets: List[set[str]] = []
+        for term in clause.terms:
+            candidates = set(term_postings.get(term, {}))
+            if clause.expand:
+                for synonym in rules.alternatives(term):
+                    candidates.update(term_postings.get(synonym, {}))
+            candidate_sets.append(candidates)
+        return sorted(set.intersection(*candidate_sets)) if candidate_sets else []
 
     def _field_hit(
         self,
@@ -173,8 +225,14 @@ class SearchView:
                 chains = [chain]
         if not chains:
             return None
-        chosen = self._choose_chain(chains)
-        return ClauseHit(clause, field_name, chosen)
+        return ClauseHit(clause, field_name, self._choose_chain(chains))
+
+    def _variants(self, term: str, expand: bool, rules: SynonymRules) -> List[Tuple[str, Optional[Tuple[str, ...]]]]:
+        variants: List[Tuple[str, Optional[Tuple[str, ...]]]] = [(term, None)]
+        if expand:
+            for synonym in rules.alternatives(term):
+                variants.append((synonym, rules.group_for(term, synonym)))
+        return variants
 
     def _term_chain(
         self,
@@ -183,29 +241,32 @@ class SearchView:
         clause: Clause,
         rules: SynonymRules,
     ) -> Optional[List[TermHit]]:
-        chain: List[TermHit] = []
-        for term in clause.terms:
-            matched_as = self._present_token(term_postings, doc_id, term, clause.expand, rules)
-            if matched_as is None:
-                return None
-            chain.append(TermHit(term, matched_as))
-        return chain
+        # Every matched token must consume a distinct position: repeated
+        # query terms (and synonym overlaps) cannot share one occurrence.
+        # Search all assignments so a locally attractive choice cannot
+        # starve a later term; the canonical chain is picked afterwards.
+        variants = [self._variants(term, clause.expand, rules) for term in clause.terms]
+        chains: List[List[TermHit]] = []
 
-    def _present_token(
-        self,
-        term_postings: Dict[str, Dict[str, List[int]]],
-        doc_id: str,
-        term: str,
-        expand: bool,
-        rules: SynonymRules,
-    ) -> Optional[str]:
-        if doc_id in term_postings.get(term, {}):
-            return term
-        if expand:
-            for synonym in rules.alternatives(term):
-                if doc_id in term_postings.get(synonym, {}):
-                    return synonym
-        return None
+        def extend(index: int, chain: List[TermHit], used: set[int]) -> None:
+            if index == len(clause.terms):
+                chains.append(list(chain))
+                return
+            term = clause.terms[index]
+            seen: set[Tuple[str, int]] = set()
+            for token, group in variants[index]:
+                for position in term_postings.get(token, {}).get(doc_id, []):
+                    if position in used or (token, position) in seen:
+                        continue
+                    seen.add((token, position))
+                    chain.append(TermHit(term, token, position, group))
+                    used.add(position)
+                    extend(index + 1, chain, used)
+                    used.remove(position)
+                    chain.pop()
+
+        extend(0, [], set())
+        return self._choose_chain(chains) if chains else None
 
     def _phrase_chains(
         self,
@@ -214,57 +275,46 @@ class SearchView:
         clause: Clause,
         rules: SynonymRules,
     ) -> List[List[TermHit]]:
-        start_positions = set(term_postings.get(clause.terms[0], {}).get(doc_id, []))
-        if clause.expand:
-            for synonym in rules.alternatives(clause.terms[0]):
-                start_positions.update(term_postings.get(synonym, {}).get(doc_id, []))
+        variants = [self._variants(term, clause.expand, rules) for term in clause.terms]
+        position_lists = [
+            sorted(
+                {
+                    (position, token, group)
+                    for token, group in variant_options
+                    for position in term_postings.get(token, {}).get(doc_id, [])
+                }
+            )
+            for variant_options in variants
+        ]
+        slop = clause.slop or 0
         chains: List[List[TermHit]] = []
-        for start in start_positions:
-            chain = self._chain_at(term_postings, doc_id, clause, start, rules)
-            if chain is not None:
-                chains.append(chain)
+
+        def extend(index: int, previous: int, budget: int, chain: List[TermHit], used: set[int]) -> None:
+            if index == len(clause.terms):
+                chains.append(list(chain))
+                return
+            term = clause.terms[index]
+            for position, token, group in position_lists[index]:
+                if position <= previous or position in used:
+                    continue
+                gap = position - previous - 1
+                if gap > budget:
+                    break
+                chain.append(TermHit(term, token, position, group))
+                used.add(position)
+                extend(index + 1, position, budget - gap, chain, used)
+                used.remove(position)
+                chain.pop()
+
+        first = clause.terms[0]
+        for position, token, group in position_lists[0]:
+            extend(1, position, slop, [TermHit(first, token, position, group)], {position})
         return chains
 
-    def _chain_at(
-        self,
-        term_postings: Dict[str, Dict[str, List[int]]],
-        doc_id: str,
-        clause: Clause,
-        start: int,
-        rules: SynonymRules,
-    ) -> Optional[List[TermHit]]:
-        chain: List[TermHit] = []
-        used_positions: set[int] = set()
-        for offset, term in enumerate(clause.terms):
-            position = start + offset
-            if position in used_positions:
-                return None
-            token = self._token_at(term_postings, doc_id, term, position, clause.expand, rules)
-            if token is None:
-                return None
-            used_positions.add(position)
-            chain.append(TermHit(term, token))
-        return chain
-
-    def _token_at(
-        self,
-        term_postings: Dict[str, Dict[str, List[int]]],
-        doc_id: str,
-        term: str,
-        position: int,
-        expand: bool,
-        rules: SynonymRules,
-    ) -> Optional[str]:
-        if position in term_postings.get(term, {}).get(doc_id, []):
-            return term
-        if expand:
-            for synonym in rules.alternatives(term):
-                if position in term_postings.get(synonym, {}).get(doc_id, []):
-                    return synonym
-        return None
-
     def _choose_chain(self, chains: List[List[TermHit]]) -> List[TermHit]:
-        def score(chain: List[TermHit]) -> Tuple[int, ...]:
-            return tuple(0 if hit.kind == "original" else 1 for hit in chain)
+        def score(chain: List[TermHit]) -> Tuple[Tuple[int, ...], Tuple[int, ...], int, ...]:
+            kinds = tuple(0 if hit.kind == "original" else 1 for hit in chain)
+            positions = tuple(hit.position for hit in chain)
+            return (kinds, positions, positions[-1] - positions[0])
 
         return min(chains, key=score)

@@ -244,8 +244,23 @@ class SearchEngine:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.segments_dir.mkdir(exist_ok=True)
         self.snapshots_dir.mkdir(exist_ok=True)
+        self._cleanup_staging_files()
         self.rules = self._load_rules()
         self._load_manifest()
+
+    def _cleanup_staging_files(self) -> None:
+        """Remove temp files left behind by an interrupted commit/compaction.
+
+        Every publication swaps a fully-fsynced temp file atomically into
+        place, so an interrupted writer can only leave unreferenced temp
+        files; the previously published manifest and segments are intact.
+        """
+        for entry in self.segments_dir.iterdir():
+            if entry.is_file() and entry.name.endswith(".tmp") and entry.name.startswith(".seg-"):
+                try:
+                    entry.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _load_rules(self) -> SynonymRules:
         if not self.rules_path.exists():
