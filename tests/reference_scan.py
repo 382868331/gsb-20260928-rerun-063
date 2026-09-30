@@ -1,34 +1,37 @@
-import re
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from local_search.analysis import SynonymRules, field_tokens
+from local_search.matcher import ClauseHit, match_query
+from local_search.query import parse_query
 
 
-TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
+def scan(
+    documents: Iterable[Dict[str, object]],
+    query_text: str,
+    synonyms: Optional[Mapping[str, Sequence[str]]] = None,
+) -> List[str]:
+    """Direct in-memory scan used as the reference implementation."""
+    rules = SynonymRules.from_mapping(synonyms or {}, version=1)
+    query = parse_query(query_text)
+    hits = []
+    for doc in documents:
+        tokenized = field_tokens(doc["fields"])
+        if match_query(doc["fields"], tokenized, query, rules) is not None:
+            hits.append(doc["id"])
+    return hits
 
 
-def scan(documents: Iterable[Dict[str, object]], query_text: str) -> List[str]:
-    return [
-        doc["id"]
-        for doc in documents
-        if all(_matches(doc["fields"], clause) for clause in _parse(query_text))
-    ]
-
-
-def _parse(query_text: str) -> List[tuple[Optional[str], List[str], bool]]:
-    pattern = r'(?:(\w+):)?(?:"([^"]*)"|(\S+))'
-    return [
-        (field or None, TOKEN_RE.findall((phrase or word).lower()), bool(phrase))
-        for field, phrase, word in re.findall(pattern, query_text)
-    ]
-
-
-def _matches(fields: Dict[str, object], clause: tuple[Optional[str], List[str], bool]) -> bool:
-    field, terms, phrase = clause
-    names = [field] if field is not None else list(fields)
-    return any(_field_matches(fields.get(name, ""), terms, phrase) for name in names)
-
-
-def _field_matches(value: object, terms: Sequence[str], phrase: bool) -> bool:
-    tokens = TOKEN_RE.findall(str(value).lower())
-    if not phrase:
-        return all(term in tokens for term in terms)
-    return any(tokens[start : start + len(terms)] == terms for start in range(len(tokens) - len(terms) + 1))
+def scan_explained(
+    documents: Iterable[Dict[str, object]],
+    query_text: str,
+    synonyms: Optional[Mapping[str, Sequence[str]]] = None,
+) -> List[Tuple[str, List[ClauseHit]]]:
+    rules = SynonymRules.from_mapping(synonyms or {}, version=1)
+    query = parse_query(query_text)
+    output: List[Tuple[str, List[ClauseHit]]] = []
+    for doc in documents:
+        tokenized = field_tokens(doc["fields"])
+        matched = match_query(doc["fields"], tokenized, query, rules)
+        if matched is not None:
+            output.append((doc["id"], matched))
+    return output

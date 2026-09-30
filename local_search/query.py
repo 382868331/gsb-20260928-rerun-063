@@ -8,6 +8,7 @@ from .analysis import tokenize
 class Clause:
     field: Optional[str]
     phrase: bool
+    expand: bool
     terms: List[str]
     raw: str
 
@@ -15,6 +16,7 @@ class Clause:
 @dataclass(frozen=True)
 class Query:
     clauses: List[Clause]
+    expand: bool = False
 
 
 def _read_quoted(text: str, start: int) -> tuple[str, int]:
@@ -38,6 +40,7 @@ def _read_quoted(text: str, start: int) -> tuple[str, int]:
 
 def parse_query(text: str) -> Query:
     clauses = []
+    global_expand = text.lstrip().startswith("~")
     position = 0
     while position < len(text):
         while position < len(text) and text[position].isspace():
@@ -55,12 +58,17 @@ def parse_query(text: str) -> Query:
         else:
             position = start
 
+        clause_expand = global_expand
+        if position < len(text) and text[position] == "~":
+            clause_expand = True
+            position += 1
+
         if position < len(text) and text[position] == '"':
             phrase_text, position = _read_quoted(text, position)
             terms = tokenize(phrase_text)
             if not terms:
                 raise ValueError("Empty phrase is not supported")
-            clauses.append(Clause(field, True, terms, text[start:position]))
+            clauses.append(Clause(field, True, clause_expand, terms, text[start:position]))
         else:
             word_start = position
             while position < len(text) and not text[position].isspace():
@@ -72,8 +80,8 @@ def parse_query(text: str) -> Query:
             if not terms:
                 position += 1
                 continue
-            clauses.append(Clause(field, False, terms, word))
+            clauses.append(Clause(field, False, clause_expand, terms, word))
 
     if not clauses:
         raise ValueError("Empty query")
-    return Query(clauses)
+    return Query(clauses, global_expand)

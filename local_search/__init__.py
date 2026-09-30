@@ -1,4 +1,5 @@
-from .engine import SearchEngine
+from .analysis import SynonymRules
+from .engine import SearchEngine, Snapshot
 from .query import Query
 
-__all__ = ["SearchEngine", "Query"]
+__all__ = ["SearchEngine", "Snapshot", "SynonymRules", "Query"]

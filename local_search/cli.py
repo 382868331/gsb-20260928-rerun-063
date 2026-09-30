@@ -19,9 +19,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     search = commands.add_parser("search")
     search.add_argument("query")
     search.add_argument("--limit", type=int)
+    search.add_argument("--snapshot", type=int)
+    search.add_argument("--no-explain", action="store_true")
+    search.add_argument("--expand", action="store_true")
     get = commands.add_parser("get")
     get.add_argument("id")
     commands.add_parser("docs")
+    commands.add_parser("snapshots")
+    synonyms = commands.add_parser("synonyms")
+    synonyms.add_argument("rules_json")
 
     args = parser.parse_args(argv)
     engine = SearchEngine(args.index)
@@ -35,11 +41,22 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.command == "commit":
         engine.commit()
     elif args.command == "search":
-        print(json.dumps(engine.search(args.query, args.limit), ensure_ascii=False, indent=2))
+        target = engine.snapshot(args.snapshot)
+        print(json.dumps(
+            target.search(args.query, args.limit, explain=not args.no_explain, expand=args.expand or None),
+            ensure_ascii=False,
+            indent=2,
+        ))
     elif args.command == "get":
         print(json.dumps(engine.get(args.id), ensure_ascii=False, indent=2))
     elif args.command == "docs":
         print(json.dumps(engine.all_documents(), ensure_ascii=False, indent=2))
+    elif args.command == "snapshots":
+        print(json.dumps(engine.snapshots(), ensure_ascii=False, indent=2))
+    elif args.command == "synonyms":
+        version = engine.set_synonyms(json.loads(args.rules_json))
+        engine.commit()
+        print(json.dumps({"rules_version": version}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
