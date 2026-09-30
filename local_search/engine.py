@@ -199,6 +199,7 @@ class SearchEngine:
                         score,
                         detail.get("term_contributions", {}),
                         query.rules.version if query.rules is not None else None,
+                        SearchView.excluded_rawhs(query),
                     ),
                 }
             )

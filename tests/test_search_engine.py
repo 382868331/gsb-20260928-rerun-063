@@ -1,10 +1,11 @@
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from local_search.engine import SearchEngine
-from local_search.query import parse_query
+from local_search.query import Clause, Query, parse_query
 from local_search.ranking import BM25Ranker, ConstantScoreRanker
 from local_search.segment import write_segment
 from local_search.synonyms import SynonymRules
@@ -45,6 +46,24 @@ EXPANDED_QUERIES = [
     "~title:metro body:subway",
 ]
 
+SLOP_AND_EXCLUSION_QUERIES = [
+    '"york new"~2',
+    '"york new"~1',
+    'body:"new park"~3',
+    'body:"new park"~1',
+    '~"fresh park"~3',
+    '~title:"fresh metro"~1',
+    '"repeat repeat"~1',
+    '~"repeat repeat"~2',
+    'new -york',
+    'new -"new york"',
+    'new york -title:news',
+    '~new -~fresh',
+    '~"new york" -body:park',
+    'title:new -body:park body:"new park"~10',
+    '-"york new"~2 "york new"~3',
+]
+
 
 class SearchEngineTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -81,6 +100,104 @@ class SearchEngineTest(unittest.TestCase):
             with self.subTest(query=query):
                 expected = scan(self._docs(), query, rules_v1())
                 actual = [result["id"] for result in self.engine.search(query)]
+                self.assertEqual(actual, expected)
+
+    def test_slop_and_exclusion_queries_match_direct_scan(self) -> None:
+        for query in SLOP_AND_EXCLUSION_QUERIES:
+            with self.subTest(query=query):
+                expected = scan(self._docs(), query, rules_v1())
+                actual = [result["id"] for result in self.engine.search(query)]
+                self.assertEqual(actual, expected)
+
+    def test_slop_explanations_match_scan_chains(self) -> None:
+        for query in [
+            '"york new"~2',
+            'body:"new park"~3',
+            '~"fresh park"~3',
+        ]:
+            with self.subTest(query=query):
+                reference = scan_explained(self._docs(), query, rules_v1())
+                results = {r["id"]: r for r in self.engine.search(query)}
+                self.assertEqual(set(results), set(reference))
+                for doc_id, field_hits in reference.items():
+                    clauses = results[doc_id]["explanation"]["clauses"]
+                    for clause_hit, (field, _raw, chain) in zip(clauses, field_hits):
+                        self.assertEqual(clause_hit["matched_field"], field)
+                        expected_pairs = [(term, matched) for term, matched, _ in chain]
+                        actual_pairs = [(t["term"], t["matched_as"]) for t in clause_hit["terms"]]
+                        self.assertEqual(actual_pairs, expected_pairs)
+                        expected_positions = [position for _, _, position in chain]
+                        self.assertEqual(clause_hit["positions"], expected_positions)
+
+    def test_explanation_lists_excluded_clauses_and_positions(self) -> None:
+        results = {r["id"]: r for r in self.engine.search('new york -title:news')}
+        for result in results.values():
+            self.assertEqual(result["explanation"]["excluded_clauses"], ["-title:news"])
+            for clause in result["explanation"]["clauses"]:
+                positions = [term["position"] for term in clause["terms"]]
+                self.assertEqual(len(set(positions)), len(positions))
+
+    def test_repeated_term_clause_uses_distinct_positions(self) -> None:
+        results = {r["id"]: r for r in self.engine.search('title:repeat repeat')}
+        terms = results["d4"]["explanation"]["clauses"][0]["terms"]
+        positions = [term["position"] for term in terms]
+        self.assertEqual(len(positions), len(set(positions)))
+
+    def test_query_result_is_independent_of_clause_order(self) -> None:
+        text = '~"new york" body:park -title:other "york new"~5'
+        parsed = parse_query(text)
+        seen = None
+        for order in itertools.permutations(range(len(parsed.clauses))):
+            reordered = Query([parsed.clauses[index] for index in order])
+            results = self.engine.search(reordered)
+            summary = sorted(
+                (r["id"], r["explanation"]["clauses"], r["explanation"]["excluded_clauses"])
+                for r in results
+            )
+            if seen is None:
+                seen = summary
+            else:
+                self.assertEqual(summary, seen)
+
+    def test_multi_segment_live_index_matches_scan_regardless_of_order(self) -> None:
+        self.engine.upsert("d2", {"title": "york fresh gap new", "body": "rewritten d2"})
+        self.engine.upsert("d7", {"title": "fresh city news", "body": "new gap gap york park"})
+        self.engine.delete("d5")
+        self.engine.commit()
+        live_docs = self.engine.all_documents()
+        for query in SLOP_AND_EXCLUSION_QUERIES + EXPANDED_QUERIES:
+            with self.subTest(query=query):
+                expected = scan(live_docs, query, rules_v1())
+                parsed = parse_query(query)
+                for permutation in itertools.permutations(parsed.clauses):
+                    actual = [r["id"] for r in self.engine.search(Query(list(permutation)))]
+                    self.assertEqual(actual, expected)
+
+    def test_snapshot_matches_direct_scan_after_changes_and_compaction(self) -> None:
+        self.engine.publish_snapshot("freeze")
+        snapshot_docs = [
+            {"id": doc_id, "fields": doc.fields}
+            for doc_id, doc in self.engine.snapshot_view("freeze").documents.items()
+        ]
+
+        self.engine.upsert("d7", {"title": "fresh novel metro", "body": "wide gap york then new later"})
+        self.engine.delete("d2")
+        self.engine.commit()
+        self.engine.set_synonym_rules(rules_v2())
+
+        queries = SLOP_AND_EXCLUSION_QUERIES + EXPANDED_QUERIES
+        for query in queries:
+            with self.subTest(query=query):
+                expected = scan(snapshot_docs, query, rules_v1())
+                actual = [r["id"] for r in self.engine.search_snapshot("freeze", query)]
+                self.assertEqual(actual, expected)
+
+        # A compaction of the live index must not change snapshot answers.
+        self.engine.compact()
+        for query in queries:
+            with self.subTest(query=query, compacted=True):
+                expected = scan(snapshot_docs, query, rules_v1())
+                actual = [r["id"] for r in self.engine.search_snapshot("freeze", query)]
                 self.assertEqual(actual, expected)
 
     def test_explanation_reports_original_vs_synonym(self) -> None:

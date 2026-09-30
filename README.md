@@ -37,11 +37,16 @@ engine.set_synonym_rules(
 engine.search('~"new york"')   # 扩展短语：fresh city 也命中
 engine.search('~title:fresh')  # 等价写法 title:~fresh
 engine.search('"new york"')    # 不带 ~：严格原词序，只用原词
+engine.search('"york new"~2') # 间隔短语：保持词序、总间隔不超过 2 个词
+engine.search('new -york')     # 排除词：命中 new 但不含 york 的文档
+engine.search('~"new york" -body:park  # 连续短语 + 间隔短语 + 排除词可混用
 ```
 
-查询中的空白分隔条件是 AND 关系。短语只在同一个字段内检查连续位置，因此重复词和跨字段词序不会混算（同义词扩展也只替换同字段同一位置上的词，跨字段不会拼成短语）。
+查询中的空白分隔条件是 AND 关系。带 `-` 前缀的条件是排除条件，命中文档将被剔除；字段限定（如 `-title:news`）和短语（如 `-"new york"`）同样支持排除。`"..."~N` 是间隔短语：各词必须保持查询中的先后顺序，允许中间插入其他词，但所有间隔加起来不超过 `N`（`~0` 等价于严格连续，也可以省略）。同义词 `~` 与距离限制可以叠加，例如 `~"fresh park"~3`。
 
-每条结果带 `explanation`：`kind` 为 `original` 或 `synonym`，`matched_as` 给出实际命中的词，`synonym_version` 标明所用规则版本，BM25 下还带每个命中词的分数贡献。
+短语只在同一个字段内检查位置，因此跨字段的片段不会拼成短语（同义词扩展也只替换同字段同一位置上的词）。一个查询里重复出现的词必须落在不同位置上：`"repeat repeat"` 要求两个相邻的 `repeat`，`"repeat repeat"~1` 要求中间至多隔一个词，重复词不能重复占用同一个位置。间隔短语会从全部合法位置链中确定性地选择“原词最多、跨度最小、起点最早”的一条，因此无论段、倒排表还是子句以什么顺序执行，结果与解释都一致。
+
+每条结果带 `explanation`：`kind` 为 `original` 或 `synonym`，`matched_as` 给出实际命中的词，`position` 给出该词实际占用的字段内位置（每个子句还汇总 `positions` 与 `slop`），用户可以据此区分原词匹配和规则扩展；`synonym_version` 标明所用规则版本，BM25 下还带每个命中词的分数贡献。`excluded_clauses` 列出本次查询实际应用的排除条件原文。
 
 ## 规则版本、在途查询与快照
 
@@ -74,4 +79,4 @@ python -m local_search.cli --index ./data/index snapshot-search v1 '~"new york"'
 python -m unittest discover -v
 ```
 
-测试会先把小文档集（含重复词、歧义词组、修改与删除）在两种规则版本下与直接顺序扫描的结果逐条对照，检查解释中的原词/同义词标注、跨字段短语不拼接、在途查询保留旧版本，再模拟索引整理中断确认已发布快照与旧 manifest 仍可查询。
+测试会先把小文档集（含重复词、歧义词组、修改与删除）在两种规则版本下与直接顺序扫描的结果逐条对照，检查解释中的原词/同义词标注与实际位置、跨字段短语不拼接、间隔短语的距离边界、排除词、多段索引下任意子句执行顺序结果相同、在途查询保留旧版本，再模拟索引整理中断确认已发布快照与旧 manifest 仍可查询，并对快照在规则升级、文档修改和整理前后的全部混合查询逐条核对直接扫描结果。

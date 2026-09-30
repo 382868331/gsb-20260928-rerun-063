@@ -12,6 +12,8 @@ class Clause:
     field: Optional[str]
     phrase: bool
     expand: bool
+    exclude: bool
+    slop: int
     terms: List[str]
     raw: str
 
@@ -59,9 +61,18 @@ def parse_query(text: str) -> Query:
         if position >= len(text):
             break
 
-        start = position
-        if text[position] == "~":
+        exclude = False
+        if text[position] == "-":
+            exclude = True
             position += 1
+
+        expand = False
+        if position < len(text) and text[position] == "~":
+            expand = True
+            position += 1
+
+        start = position
+        raw_start = position
         field_start = position
         field = None
         while position < len(text) and (text[position].isalnum() or text[position] in "_"):
@@ -74,20 +85,29 @@ def parse_query(text: str) -> Query:
             position = start
             token_start = start
 
-        expand = False
-        if text[start] == "~":
-            expand = True
         if position < len(text) and text[position] == "~":
             expand = True
             position += 1
             token_start = position
 
+        slop = 0
         if position < len(text) and text[position] == '"':
             phrase_text, position = _read_quoted(text, position)
             terms = tokenize(phrase_text)
             if not terms:
                 raise ValueError("Empty phrase is not supported")
-            clauses.append(Clause(field, True, expand, terms, text[token_start:position]))
+            # Optional distance limit: "word word"~3 (0 means contiguous).
+            if position < len(text) and text[position] == "~":
+                number_start = position + 1
+                number_end = number_start
+                while number_end < len(text) and text[number_end].isdigit():
+                    number_end += 1
+                if number_end == number_start:
+                    raise ValueError("Phrase distance must be a non-negative integer")
+                slop = int(text[number_start:number_end])
+                position = number_end
+            raw = ("-" if exclude else "") + text[raw_start:position]
+            clauses.append(Clause(field, True, expand, exclude, slop, terms, raw))
         else:
             word_start = position
             while position < len(text) and not text[position].isspace():
@@ -99,7 +119,8 @@ def parse_query(text: str) -> Query:
             if not terms:
                 position += 1
                 continue
-            clauses.append(Clause(field, False, expand, terms, word))
+            raw = ("-" if exclude else "") + text[raw_start:position]
+            clauses.append(Clause(field, False, expand, exclude, 0, terms, raw))
 
     if not clauses:
         raise ValueError("Empty query")
