@@ -22,6 +22,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     get = commands.add_parser("get")
     get.add_argument("id")
     commands.add_parser("docs")
+    snapshot = commands.add_parser("snapshot")
+    snapshot.add_argument("name")
+    snapshot_search = commands.add_parser("snapshot-search")
+    snapshot_search.add_argument("name")
+    snapshot_search.add_argument("query")
+    snapshot_search.add_argument("--limit", type=int)
 
     args = parser.parse_args(argv)
     engine = SearchEngine(args.index)
@@ -40,6 +46,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(json.dumps(engine.get(args.id), ensure_ascii=False, indent=2))
     elif args.command == "docs":
         print(json.dumps(engine.all_documents(), ensure_ascii=False, indent=2))
+    elif args.command == "snapshot":
+        print(json.dumps(engine.publish_snapshot(args.name), ensure_ascii=False, indent=2))
+    elif args.command == "snapshot-search":
+        print(json.dumps(engine.search_snapshot(args.name, args.query, args.limit), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

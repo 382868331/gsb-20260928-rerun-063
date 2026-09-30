@@ -4,24 +4,25 @@ from typing import Dict, List, Protocol, Sequence
 from .analysis import field_tokens
 from .query import Query
 from .segment import StoredDocument
+from .view import DocumentMatch
 
 
 class Ranker(Protocol):
     def score(
         self,
-        documents: Sequence[StoredDocument],
+        matches: Dict[str, DocumentMatch],
         query: Query,
-    ) -> Dict[str, float]:
+    ) -> Dict[str, Dict[str, object]]:
         ...
 
 
 class ConstantScoreRanker:
     def score(
         self,
-        documents: Sequence[StoredDocument],
+        matches: Dict[str, DocumentMatch],
         query: Query,
-    ) -> Dict[str, float]:
-        return {document.id: 0.0 for document in documents}
+    ) -> Dict[str, Dict[str, object]]:
+        return {doc_id: {"score": 0.0, "term_contributions": {}} for doc_id in matches}
 
 
 class BM25Ranker:
@@ -31,15 +32,18 @@ class BM25Ranker:
 
     def score(
         self,
-        documents: Sequence[StoredDocument],
+        matches: Dict[str, DocumentMatch],
         query: Query,
-    ) -> Dict[str, float]:
-        document_count = len(documents) or 1
-        terms = list(dict.fromkeys(term for clause in query.clauses for term in clause.terms))
+    ) -> Dict[str, Dict[str, object]]:
+        documents = [match.document for match in matches.values()]
+        document_count = len(matches) or 1
+        terms = list(dict.fromkeys(token for match in matches.values() for token in match.matched_tokens()))
         token_fields = [field_tokens(doc.fields) for doc in documents]
         lengths = [sum(len(tokens) for tokens in fields.values()) for fields in token_fields]
         average_length = sum(lengths) / document_count or 1.0
-        result = {doc.id: 0.0 for doc in documents}
+        result: Dict[str, Dict[str, object]] = {
+            doc.id: {"score": 0.0, "term_contributions": {}} for doc in documents
+        }
 
         for term in terms:
             containing = sum(
@@ -50,5 +54,11 @@ class BM25Ranker:
                 frequency = sum(tokens.count(term) for tokens in fields.values())
                 if frequency:
                     normalization = self.k1 * (1 - self.b + self.b * length / average_length)
-                    result[doc.id] += idf * frequency * (self.k1 + 1) / (frequency + normalization)
+                    contribution = idf * frequency * (self.k1 + 1) / (frequency + normalization)
+                    result[doc.id]["score"] = float(result[doc.id]["score"]) + contribution
+                    result[doc.id]["term_contributions"][term] = {
+                        "idf": idf,
+                        "document_frequency": frequency,
+                        "contribution": contribution,
+                    }
         return result
