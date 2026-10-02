@@ -19,6 +19,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     search = commands.add_parser("search")
     search.add_argument("query")
     search.add_argument("--limit", type=int)
+    search_page = commands.add_parser("search-page")
+    search_page.add_argument("query")
+    search_page.add_argument("--page-size", type=int, default=10)
+    search_page.add_argument("--budget", type=int)
+    search_page.add_argument("--snapshot")
+    fetch_page = commands.add_parser("fetch-page")
+    fetch_page.add_argument("run_id")
+    fetch_page.add_argument("cursor")
+    fetch_page.add_argument("--budget", type=int)
+    rank_changes = commands.add_parser("rank-changes")
+    rank_changes.add_argument("previous_run_id")
+    rank_changes.add_argument("current_run_id")
     get = commands.add_parser("get")
     get.add_argument("id")
     commands.add_parser("docs")
@@ -42,6 +54,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         engine.commit()
     elif args.command == "search":
         print(json.dumps(engine.search(args.query, args.limit), ensure_ascii=False, indent=2))
+    elif args.command == "search-page":
+        print(
+            json.dumps(
+                engine.start_search(
+                    args.query,
+                    page_size=args.page_size,
+                    budget=args.budget,
+                    snapshot=args.snapshot,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "fetch-page":
+        print(
+            json.dumps(
+                engine.fetch_page(args.run_id, args.cursor, budget=args.budget),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    elif args.command == "rank-changes":
+        print(
+            json.dumps(
+                engine.explain_rank_changes(args.previous_run_id, args.current_run_id),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
     elif args.command == "get":
         print(json.dumps(engine.get(args.id), ensure_ascii=False, indent=2))
     elif args.command == "docs":

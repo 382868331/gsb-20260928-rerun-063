@@ -32,6 +32,43 @@ class Query:
         """
         return self if self.rules is not None else Query(self.clauses, current)
 
+    @property
+    def text(self) -> str:
+        return " ".join(clause.raw for clause in self.clauses)
+
+    def to_payload(self) -> Dict[str, object]:
+        return {
+            "text": self.text,
+            "clauses": [
+                {
+                    "field": clause.field,
+                    "phrase": clause.phrase,
+                    "expand": clause.expand,
+                    "exclude": clause.exclude,
+                    "slop": clause.slop,
+                    "terms": list(clause.terms),
+                    "raw": clause.raw,
+                }
+                for clause in self.clauses
+            ],
+        }
+
+    @staticmethod
+    def from_payload(payload: Dict[str, object]) -> "Query":
+        clauses = [
+            Clause(
+                field=clause.get("field"),
+                phrase=bool(clause["phrase"]),
+                expand=bool(clause["expand"]),
+                exclude=bool(clause["exclude"]),
+                slop=int(clause["slop"]),
+                terms=list(clause["terms"]),  # type: ignore[arg-type]
+                raw=str(clause["raw"]),
+            )
+            for clause in payload.get("clauses", [])  # type: ignore[union-attr]
+        ]
+        return Query(clauses)
+
 
 def _read_quoted(text: str, start: int) -> tuple[str, int]:
     end = start + 1

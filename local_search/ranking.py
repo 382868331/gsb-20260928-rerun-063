@@ -62,3 +62,35 @@ class BM25Ranker:
                         "contribution": contribution,
                     }
         return result
+
+
+def ranker_descriptor(ranker: Ranker) -> Dict[str, object]:
+    if isinstance(ranker, ConstantScoreRanker):
+        return {"type": "ConstantScoreRanker", "module": "local_search.ranking", "params": {}}
+    if isinstance(ranker, BM25Ranker):
+        return {
+            "type": "BM25Ranker",
+            "module": "local_search.ranking",
+            "params": {"k1": ranker.k1, "b": ranker.b},
+        }
+    return {
+        "type": ranker.__class__.__name__,
+        "module": ranker.__class__.__module__,
+        "params": {},
+        "persistent": False,
+    }
+
+
+def ranker_from_descriptor(descriptor: Dict[str, object]) -> Ranker:
+    name = str(descriptor.get("type"))
+    params = descriptor.get("params", {}) or {}
+    if name == "ConstantScoreRanker":
+        return ConstantScoreRanker()
+    if name == "BM25Ranker":
+        return BM25Ranker(k1=float(params.get("k1", 1.2)), b=float(params.get("b", 0.75)))  # type: ignore[union-attr]
+    raise ValueError(f"Unsupported persistent ranker: {name}")
+
+
+def ranker_matches_descriptor(ranker: Ranker, descriptor: Dict[str, object]) -> bool:
+    current = ranker_descriptor(ranker)
+    return current.get("type") == descriptor.get("type") and current.get("params") == descriptor.get("params")

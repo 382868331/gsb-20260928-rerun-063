@@ -143,8 +143,16 @@ class SearchView:
                     visible.pop(doc_id, None)
         return cls(visible, entries, newest, rules)
 
-    def run(self, query: Query) -> Dict[str, DocumentMatch]:
-        matches: Dict[str, DocumentMatch] = {doc_id: DocumentMatch(doc) for doc_id, doc in self.documents.items()}
+    def run(self, query: Query, candidate_ids: Optional[set[str]] = None) -> Dict[str, DocumentMatch]:
+        if candidate_ids is None:
+            visible_documents = self.documents
+        else:
+            visible_documents = {
+                doc_id: doc for doc_id, doc in self.documents.items() if doc_id in candidate_ids
+            }
+        matches: Dict[str, DocumentMatch] = {
+            doc_id: DocumentMatch(doc) for doc_id, doc in visible_documents.items()
+        }
         for clause in query.clauses:
             clause_matches = self._match_clause(clause, query.rules or self.rules)
             if clause.exclude:
@@ -249,7 +257,7 @@ class SearchView:
         Original wording is preferred over a synonym when both are available
         at the same earliest position, so explanations are deterministic.
         """
-        best: Optional[Tuple[int, int, str]] = None  # (position, original-first, token)
+        best: Optional[Tuple[int, int, int, str]] = None  # (position, original-first, variant-index, token)
         for variant_index, variant in enumerate(self._variants(term, clause, rules)):
             for position in term_postings.get(variant, {}).get(doc_id, []):
                 if position <= after or position in used:
@@ -259,7 +267,7 @@ class SearchView:
                     best = rank + (variant,)
         if best is None:
             return None
-        return best[2], best[0]
+        return best[3], best[0]
 
     def _phrase_chains(
         self,

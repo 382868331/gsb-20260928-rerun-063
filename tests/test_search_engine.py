@@ -341,6 +341,142 @@ class SearchEngineTest(unittest.TestCase):
             expected_snapshot,
         )
 
+    def test_fixed_perspective_paging_is_stable_across_changes_restart_and_compact(self) -> None:
+        for index in range(8):
+            self.engine.upsert(
+                f"tie{index:02d}",
+                {"title": "word word", "body": f"word tie{index:02d}"},
+            )
+        self.engine.commit()
+        expected_ids = [f"tie{index:02d}" for index in range(8)]
+
+        first = self.engine.start_search('"word word"', page_size=3)
+        self.assertEqual([item["id"] for item in first["results"]], expected_ids[:3])
+        self.assertEqual(first["page"]["number"], 1)
+        self.assertEqual(first["perspective"]["synonym_version"], 1)
+        self.assertTrue(first["next_cursor"])
+        self.assertFalse(first["exhausted"])
+
+        # The page keeps the per-document segment version used by the snapshot.
+        for item in first["results"]:
+            self.assertIsNotNone(item["document_version"])
+            self.assertEqual(item["explanation"]["synonym_version"], 1)
+            positions = item["explanation"]["clauses"][0]["positions"]
+            self.assertEqual(positions, [0, 1])
+
+        self.engine.upsert("tie00", {"title": "rewritten", "body": "cannot change paged snapshot"})
+        self.engine.upsert("tie99", {"title": "word word", "body": "newly inserted"})
+        self.engine.delete("tie01")
+        self.engine.commit()
+        self.engine.set_synonym_rules(rules_v2())
+
+        all_pages = [item["id"] for item in first["results"]]
+        cursor = first["next_cursor"]
+        while cursor is not None:
+            page = self.engine.fetch_page(first["run_id"], cursor)
+            self.assertEqual(page["perspective"]["snapshot"], first["perspective"]["snapshot"])
+            self.assertEqual(page["perspective"]["synonym_version"], 1)
+            all_pages.extend(item["id"] for item in page["results"])
+            cursor = page["next_cursor"]
+        self.assertEqual(all_pages, expected_ids)
+
+        replayed = self.engine.start_search('"word word"', page_size=3, snapshot=first["perspective"]["snapshot"])
+        replayed_ids = [item["id"] for item in replayed["results"]]
+        cursor = replayed["next_cursor"]
+        while cursor is not None:
+            page = SearchEngine(self.root, ranker=ConstantScoreRanker()).fetch_page(replayed["run_id"], cursor)
+            replayed_ids.extend(item["id"] for item in page["results"])
+            cursor = page["next_cursor"]
+        self.assertEqual(replayed_ids, expected_ids)
+
+        self.engine.compact()
+        compacted = SearchEngine(self.root, ranker=ConstantScoreRanker())
+        compacted_ids = [item["id"] for item in compacted.search_snapshot(first["perspective"]["snapshot"], '"word word"')]
+        self.assertEqual(compacted_ids, expected_ids)
+
+    def test_budgeted_paging_marks_unexamined_results_and_keeps_confirmed_order(self) -> None:
+        budget_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(budget_dir.cleanup)
+        budget_engine = SearchEngine(Path(budget_dir.name), ranker=ConstantScoreRanker())
+        for index in range(7):
+            budget_engine.upsert(
+                f"budget{index:02d}",
+                {"title": "word word", "body": f"budget{index:02d}"},
+            )
+        budget_engine.upsert("d2", {"title": "word", "body": "extra"})
+        budget_engine.commit()
+        expected_ids = [f"budget{index:02d}" for index in range(7)] + ["d2"]
+        expected_ids.sort()
+
+        first = budget_engine.start_search("word", page_size=2, budget=2)
+        self.assertEqual([item["id"] for item in first["results"]], expected_ids[:2])
+        self.assertFalse(first["exhausted"])
+        self.assertEqual(first["unexamined_candidates"], 6)
+        self.assertEqual(len(first["results"]), 2)
+
+        seen = [item["id"] for item in first["results"]]
+        cursor = first["next_cursor"]
+        pages = 1
+        while cursor is not None:
+            page = budget_engine.fetch_page(first["run_id"], cursor, budget=2)
+            pages += 1
+            seen.extend(item["id"] for item in page["results"])
+            cursor = page["next_cursor"]
+        self.assertEqual(seen, expected_ids)
+        self.assertGreaterEqual(pages, 4)
+
+    def test_rank_change_explanation_distinguishes_condition_score_and_relative_changes(self) -> None:
+        ranking_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(ranking_dir.cleanup)
+        ranking_engine = SearchEngine(Path(ranking_dir.name), ranker=BM25Ranker())
+        initial = [
+            ("filler", {"title": "unrelated", "body": "background text"}),
+            ("c1", {"title": "cat", "body": "cat"}),
+            ("c2", {"title": "cat cat", "body": "other"}),
+            ("c3", {"title": "kitten", "body": "static"}),
+        ]
+        for doc_id, fields in initial:
+            ranking_engine.upsert(doc_id, fields)
+        ranking_engine.commit()
+        ranking_engine.set_synonym_rules(SynonymRules.create(1, [["cat", "kitten"]]))
+        old_run = ranking_engine.start_search("~cat", page_size=10)
+        old_snapshot = old_run["perspective"]["snapshot"]
+
+        # c1 keeps the same literal condition but changes BM25 score; c3 moves
+        # from synonym to literal evidence; c4 enters and shifts a tie.
+        ranking_engine.upsert("c1", {"title": "cat cat cat", "body": "cat cat"})
+        ranking_engine.upsert("c3", {"title": "cat", "body": "now literal"})
+        ranking_engine.upsert("c4", {"title": "cat", "body": "new entry"})
+        ranking_engine.commit()
+        ranking_engine.set_synonym_rules(SynonymRules.create(2, [["cat", "kitten"]]))
+        new_run = ranking_engine.start_search("~cat", page_size=10)
+
+        report = ranking_engine.explain_rank_changes(old_run["run_id"], new_run["run_id"])
+        by_id = {item["id"]: item for item in report["changes"]}
+        self.assertEqual(by_id["c1"]["reason"], "score_changed")
+        self.assertEqual(by_id["c3"]["reason"], "match_condition_changed")
+        self.assertEqual(by_id["c4"]["reason"], "match_condition_added")
+        self.assertEqual(by_id["c1"]["old_evidence"]["snapshot"], old_snapshot)
+        self.assertEqual(by_id["c1"]["new_evidence"]["synonym_version"], 2)
+        self.assertIn("explanation", by_id["c3"]["old_evidence"])
+
+    def test_rank_change_relative_position_when_another_document_enters(self) -> None:
+        for index, doc_id in enumerate(["same1", "same2", "same3"]):
+            self.engine.upsert(doc_id, {"title": "word", "body": f"same {index}"})
+        self.engine.commit()
+        old_run = self.engine.start_search("word", page_size=10)
+
+        self.engine.upsert("same0", {"title": "word", "body": "sorts ahead"})
+        self.engine.commit()
+        new_run = self.engine.start_search("word", page_size=10)
+        report = self.engine.explain_rank_changes(old_run["run_id"], new_run["run_id"])
+        by_id = {item["id"]: item for item in report["changes"]}
+        self.assertEqual(by_id["same0"]["reason"], "match_condition_added")
+        self.assertEqual(by_id["same1"]["reason"], "relative_position_changed")
+        self.assertEqual(by_id["same1"]["old_position"], 2)
+        self.assertEqual(by_id["same1"]["new_position"], 3)
+        self.assertEqual(by_id["same1"]["score_delta"], 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

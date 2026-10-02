@@ -42,6 +42,27 @@ engine.search('new -york')     # 排除词：命中 new 但不含 york 的文档
 engine.search('~"new york" -body:park  # 连续短语 + 间隔短语 + 排除词可混用
 ```
 
+## 固定视角分页与排名变化
+
+`start_search()` 会自动发布一个仅供本次检索使用的不可变快照，并把查询文本、排序器参数、同义词规则、文档版本、页大小和稳定名次写入 `runs/<run-id>.json`。返回体中的 `next_cursor` 可在同一进程、重开索引或 `compact()` 后继续使用；已经确认的页只从持久化记录返回，不会因新增、删除、修改或规则升级而漏项、重复或改变语义。
+
+```python
+page = engine.start_search("~new york", page_size=20)
+while page["next_cursor"] is not None:
+    page = engine.fetch_page(page["run_id"], page["next_cursor"])
+```
+
+每条结果都带 `document_version`，解释中保留命中字段、实际词、短语位置和 `synonym_version`；页返回体的 `perspective` 同时保存完整同义词规则和全部文档版本。`budget` 限制每次继续最多检查多少候选文档，未检查完时 `exhausted` 为 `false`，`unexamined_candidates` 给出剩余候选数。无预算限制时，逐页拼接结果与同一视角一次性 `search_snapshot()` 的完整排序一致。
+
+同分结果使用文档 ID 作为最终稳定次序。两次运行可用 `explain_rank_changes(old_run_id, new_run_id)` 对比，原因分为：
+
+- `match_condition_added` / `match_condition_removed`：文档新进入或离开命中集合。
+- `match_condition_changed`：原词/同义词、字段、位置或短语链等命中条件改变。
+- `score_changed`：命中条件相同但排序分值改变。
+- `relative_position_changed`：分值和证据相同，但其他文档进入或离开造成相对名次变化。
+
+对比结果中的旧/新证据分别引用各自运行的快照，因此位置和短语解释可回到当时的文档与规则版本。也可以把已发布快照名传给 `start_search(..., snapshot="v1")`，在同一个人工研究视角上启动多次运行。
+
 查询中的空白分隔条件是 AND 关系。带 `-` 前缀的条件是排除条件，命中文档将被剔除；字段限定（如 `-title:news`）和短语（如 `-"new york"`）同样支持排除。`"..."~N` 是间隔短语：各词必须保持查询中的先后顺序，允许中间插入其他词，但所有间隔加起来不超过 `N`（`~0` 等价于严格连续，也可以省略）。同义词 `~` 与距离限制可以叠加，例如 `~"fresh park"~3`。
 
 短语只在同一个字段内检查位置，因此跨字段的片段不会拼成短语（同义词扩展也只替换同字段同一位置上的词）。一个查询里重复出现的词必须落在不同位置上：`"repeat repeat"` 要求两个相邻的 `repeat`，`"repeat repeat"~1` 要求中间至多隔一个词，重复词不能重复占用同一个位置。间隔短语会从全部合法位置链中确定性地选择“原词最多、跨度最小、起点最早”的一条，因此无论段、倒排表还是子句以什么顺序执行，结果与解释都一致。
@@ -69,6 +90,7 @@ python -m local_search.cli --index ./data/index upsert doc-1 '{"title":"new york
 python -m local_search.cli --index ./data/index search 'title:"new york"'
 python -m local_search.cli --index ./data/index snapshot v1
 python -m local_search.cli --index ./data/index snapshot-search v1 '~"new york"'
+python -m local_search.cli --index ./data/index search-page '~"new york"' --page-size 20
 ```
 
 命令行的单条写入和删除会立即提交；Python API 可在一次 `commit()` 前暂存多个操作。
