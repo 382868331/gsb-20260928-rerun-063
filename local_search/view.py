@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from .analysis import field_tokens
 from .query import Clause, Query
 from .segment import Segment, StoredDocument
 from .synonyms import SynonymRules
@@ -146,7 +147,10 @@ class SearchView:
     def run(self, query: Query) -> Dict[str, DocumentMatch]:
         matches: Dict[str, DocumentMatch] = {doc_id: DocumentMatch(doc) for doc_id, doc in self.documents.items()}
         for clause in query.clauses:
-            clause_matches = self._match_clause(clause, query.rules or self.rules)
+            if self.entries:
+                clause_matches = self._match_clause(clause, query.rules or self.rules)
+            else:
+                clause_matches = self._match_clause_in_documents(clause, query.rules or self.rules)
             if clause.exclude:
                 for doc_id in clause_matches:
                     matches.pop(doc_id, None)
@@ -158,6 +162,70 @@ class SearchView:
                     else:
                         matches[doc_id].clause_hits.append(hit)
         return matches
+
+    def _match_clause_in_documents(self, clause: Clause, rules: SynonymRules) -> Dict[str, ClauseHit]:
+        """Match a clause directly against frozen documents.
+
+        A pinned view stores document bodies instead of segment references,
+        so reopening it (or compacting the live index) never changes which
+        documents are visible or what positions their evidence points at.
+        """
+        result: Dict[str, ClauseHit] = {}
+        for doc_id in sorted(self.documents):
+            document = self.documents[doc_id]
+            field_names = [clause.field] if clause.field is not None else sorted(
+                set(self._field_index(document).keys()) | set(document.fields.keys())
+            )
+            for field_name in field_names:
+                term_postings = self._field_index(document).get(field_name, {})
+                if doc_id in self._field_docs(term_postings, clause, rules):
+                    hit = self._field_hit(term_postings, clause, doc_id, clause and _DocStub(), clause, rules) if False else self._field_hit_from_postings(term_postings, clause, doc_id, rules)
+                    if hit is not None:
+                        result[doc_id] = hit
+                        break
+        return result
+
+    def _field_index(self, document: StoredDocument) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+        cache = getattr(self, "_token_cache", None)
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_token_cache", cache) if False else setattr(self, "_token_cache", cache)
+        indexed = cache.get(document.id)
+        if indexed is None:
+            indexed = {
+                field: {
+                    term: [position for position, token in enumerate(tokens) if token == term]
+                    for term in set(tokens)
+                }
+                for field, tokens in field_tokens(document.fields).items()
+            }
+            # Fill positions for every term occurrence.
+            indexed = {}
+            for field, tokens in field_tokens(document.fields).items():
+                postings: Dict[str, List[int]] = {}
+                for position, token in enumerate(tokens):
+                    postings.setdefault(token, []).append(position)
+                indexed[field] = postings
+            cache[document.id] = indexed
+        return indexed
+
+    def _field_hit_from_postings(
+        self,
+        term_postings: Dict[str, Dict[str, List[int]]],
+        clause: Clause,
+        doc_id: str,
+        rules: SynonymRules,
+    ) -> Optional[ClauseHit]:
+        chains: List[List[TermHit]] = []
+        if clause.phrase:
+            chains = self._phrase_chains(term_postings, doc_id, clause, rules)
+        else:
+            chain = self._term_chain(term_postings, doc_id, clause, rules)
+            if chain is not None:
+                chains = [chain]
+        if not chains:
+            return None
+        return ClauseHit(clause, clause.field or "", self._choose_chain(chains))
 
     @staticmethod
     def excluded_rawhs(query: Query) -> List[str]:
