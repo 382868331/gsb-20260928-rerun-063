@@ -18,6 +18,7 @@ from .view import SearchView
 MANIFEST_NAME = "manifest.json"
 RULES_NAME = "synonyms.json"
 SNAPSHOTS_DIRNAME = "snapshots"
+RESEARCH_DIRNAME = "research"
 
 
 class SearchEngine:
@@ -25,6 +26,7 @@ class SearchEngine:
         self.directory = Path(directory)
         self.segments_dir = self.directory / "segments"
         self.snapshots_dir = self.directory / SNAPSHOTS_DIRNAME
+        self.research_dir = self.directory / RESEARCH_DIRNAME
         self.manifest_path = self.directory / MANIFEST_NAME
         self.rules_path = self.directory / RULES_NAME
         self.ranker = ranker or BM25Ranker()
@@ -175,6 +177,98 @@ class SearchEngine:
             for doc in sorted(self.live_view().documents.values(), key=lambda item: item.id)
         ]
 
+    # ----------------------------------------------------------- research sets
+
+    def create_research_set(
+        self,
+        name: str,
+        queries: "Dict[str, str] | List[tuple[str, str]]",
+        *,
+        mode: str = "any",
+        budget: Optional[int] = None,
+        snapshot: Optional[str] = None,
+    ):
+        """Confirm and save a multi-query research set against current state.
+
+        ``queries`` maps a stable label to its query text (or is a sequence
+        of ``(label, query)`` pairs).  ``mode`` is ``"any"`` (a document
+        satisfying any query joins) or ``"all"`` (it must hit every query).
+        The query texts, the complete synonym rule version and every
+        document body are pinned into the saved set.
+        """
+        from .research import QuerySpec, ResearchSet
+
+        if not name or any(char in name for char in (os.sep, "/", "\\")):
+            raise ValueError("Research set name must be a non-empty path-safe string")
+        if isinstance(queries, dict):
+            pairs = list(queries.items())
+        else:
+            pairs = [(label, raw) for label, raw in queries]
+        specs = [QuerySpec(str(label), str(raw)) for label, raw in pairs]
+        view = self.snapshot_view(snapshot) if snapshot is not None else self.live_view()
+        path = self.research_dir / f"{name}.json"
+        research = ResearchSet(
+            name,
+            specs,
+            mode,
+            view.documents,
+            view.rules,
+            self.ranker,
+            budget=budget,
+            path=path,
+        )
+        research.save()
+        return research
+
+    def open_research_set(self, name: str):
+        """Reload a saved research set; its pinned order is unchanged."""
+        from .research import ResearchSet
+
+        with (self.research_dir / f"{name}.json").open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return ResearchSet.from_payload(payload, self.research_dir / f"{name}.json", self.ranker)
+
+    def revise_research_set(
+        self,
+        name: str,
+        queries: "Dict[str, str] | List[tuple[str, str]] | None" = None,
+        *,
+        mode: Optional[str] = None,
+        budget: Optional[int] = None,
+        new_name: Optional[str] = None,
+    ) -> dict:
+        """Build a revised set from revised queries and compare with the old one.
+
+        Returns the comparison report (entered/left/moved documents with
+        reasons, and which manual decisions were inherited or dropped).  The
+        new set is saved under ``new_name`` (defaulting to ``name``).
+        """
+        from .research import QuerySpec, ResearchSet, compare_research_sets
+
+        old = self.open_research_set(name)
+        pairs = (
+            list(queries.items()) if isinstance(queries, dict)
+            else [(label, raw) for label, raw in queries] if queries is not None
+            else [(spec.label, spec.raw) for spec in old.specs]
+        )
+        specs = [QuerySpec(str(label), str(raw)) for label, raw in pairs]
+        view = self.live_view()
+        target_name = new_name or name
+        path = self.research_dir / f"{target_name}.json"
+        new = ResearchSet(
+            target_name,
+            specs,
+            mode or old.mode,
+            view.documents,
+            self.rules,
+            self.ranker,
+            budget=old.budget if budget is None else budget,
+            path=path,
+        )
+        report = compare_research_sets(old, new)
+        new.save()
+        return report
+
     def _run_query(self, view: SearchView, query: Query, limit: Optional[int]) -> List[Dict[str, object]]:
         query = query.with_rules(view.rules)
         matches = view.run(query)
@@ -245,6 +339,7 @@ class SearchEngine:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.segments_dir.mkdir(exist_ok=True)
         self.snapshots_dir.mkdir(exist_ok=True)
+        self.research_dir.mkdir(exist_ok=True)
         self.rules = self._load_rules()
         self._load_manifest()
 

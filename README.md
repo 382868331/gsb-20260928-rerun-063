@@ -80,3 +80,40 @@ python -m unittest discover -v
 ```
 
 测试会先把小文档集（含重复词、歧义词组、修改与删除）在两种规则版本下与直接顺序扫描的结果逐条对照，检查解释中的原词/同义词标注与实际位置、跨字段短语不拼接、间隔短语的距离边界、排除词、多段索引下任意子句执行顺序结果相同、在途查询保留旧版本，再模拟索引整理中断确认已发布快照与旧 manifest 仍可查询，并对快照在规则升级、文档修改和整理前后的全部混合查询逐条核对直接扫描结果。
+
+## 多查询研究集
+
+研究集把若干查询在同一研究视角下形成的候选文档固定保存，之后逐页审阅。创建时可指定组合方式：`mode="any"` 保留满足任意查询的文档，`mode="all"` 只保留同时满足全部查询的文档。每篇文档逐查询保留自己的命中来源、分数和位置证据（`per_query`），跨查询分数绝不相加成统一相关性；研究集内的相对顺序按“各查询自己的最优名次 → 命中查询数 → 完整名次向量 → 文档 ID”确定性确定。
+
+```python
+research = engine.create_research_set(
+    "study-2026-10",
+    {"q1": '~"new york"', "q2": "fresh -body:park"},
+    mode="any",
+    budget=200,          # 每个查询最多完整评分多少候选；None 表示一次穷尽
+)
+research.page(0, page_size=20)      # 按稳定顺序翻页，不重复不遗漏
+research.read_page(20)              # 读取下一页并标记为已审阅
+research.review_status()            # 已审阅/未审阅/人工排除/待评分候选
+research.decide("d9", "excluded", "人工复核：与研究问题无关")
+research.decide("d12", "included", "例外：作者人工标注，虽未命中查询")
+research.save()                     # 持久化；重开后顺序、已读位置、决定都保持
+```
+
+研究集保存时固定查询文本、完整同义词规则版本以及当时的文档体（pinned 视图），所以之后实时资料新增、修改、删除、同义词升级或整理索引，已确认的页都保持原顺序，证据位置也不漂移。
+
+**预算与未穷尽**：`budget` 未覆盖全部候选时，`exhausted` 为 `False`，未评分的命中进入 `pending_unscored`，页载荷的 `complete` 也是 `False`。暂时没出现的文档不能判断为不满足；调用 `continue_scan(更大预算或 None)` 在同一固定视角上继续评分，已确认页不变，之后的文档按同一顺序规则接续——逐页读取与一次性完整读取的顺序完全一致，同分文档按文档 ID 稳定打破平局。
+
+**修订对比**：用修订后的查询重新生成研究集时，`revise_research_set()` 返回每篇文档 `entered`/`left`/`rank_moved`/`stable` 及原因，区分 `document_changed`（文档新增、删除或正文变化）、`query_meaning_changed`（查询文本或同义词版本变化）和 `relative_order_from_other_candidates`（只是被其他候选的进出带动了相对名次）。旧研究集的人工排除/例外只在依据仍相符时继承：系统比较当时记录的逐查询证据签名（具体命中词、字段、位置），文档删除或证据变化则放入 `dropped_decisions` 要求重新审阅，绝不会只按文档 ID/名称复制决定。
+
+命令行：
+
+```bash
+python -m local_search.cli --index ./data/index research-new study '{"q1":"~new","q2":"york"}' --mode any --budget 200
+python -m local_search.cli --index ./data/index research-page study --page-size 20
+python -m local_search.cli --index ./data/index research-read study --page-size 20
+python -m local_search.cli --index ./data/index research-status study
+python -m local_search.cli --index ./data/index research-decide study d9 excluded "人工复核：无关"
+python -m local_search.cli --index ./data/index research-continue study --budget 1000
+python -m local_search.cli --index ./data/index research-revise study '{"q1":"~fresh","q2":"york"}'
+```

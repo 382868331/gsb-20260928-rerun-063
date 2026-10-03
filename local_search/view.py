@@ -131,6 +131,16 @@ class SearchView:
         self.rules = rules
 
     @classmethod
+    def pinned(cls, documents: Dict[str, StoredDocument], rules: SynonymRules) -> "SearchView":
+        """Freeze document bodies instead of referencing segments.
+
+        Reopening the view, compacting the live index or deleting segments
+        can therefore never change which documents are visible or which
+        positions the evidence points at.
+        """
+        return cls(dict(documents), [], {}, rules)
+
+    @classmethod
     def live(cls, segments: List[Segment], sequences: Dict[str, int], deletes: Dict[str, int], rules: SynonymRules) -> "SearchView":
         entries = [_SegmentEntry(segment, sequences[segment.segment_id]) for segment in segments]
         visible: Dict[str, StoredDocument] = {}
@@ -177,29 +187,92 @@ class SearchView:
                 set(self._field_index(document).keys()) | set(document.fields.keys())
             )
             for field_name in field_names:
-                term_postings = self._field_index(document).get(field_name, {})
-                if doc_id in self._field_docs(term_postings, clause, rules):
-                    hit = self._field_hit(term_postings, clause, doc_id, clause and _DocStub(), clause, rules) if False else self._field_hit_from_postings(term_postings, clause, doc_id, rules)
-                    if hit is not None:
-                        result[doc_id] = hit
-                        break
+                field_postings = self._field_index(document).get(field_name, {})
+                hit = self._field_hit_from_doc_field(field_postings, clause, doc_id, rules)
+                if hit is not None:
+                    result[doc_id] = ClauseHit(clause, field_name, hit.terms)
+                    break
         return result
 
+    def _field_hit_from_doc_field(self, field_postings, clause, doc_id, rules):
+        chains: List[List[TermHit]] = []
+        if clause.phrase:
+            chains = self._doc_phrase_chains(field_postings, clause, rules)
+        else:
+            chain = self._doc_term_chain(field_postings, clause, rules)
+            if chain is not None:
+                chains = [chain]
+        if not chains:
+            return None
+        return ClauseHit(clause, "", self._choose_chain(chains))
+
+    @staticmethod
+    def _doc_find_token(field_postings, clause_term, expand, rules, after, used):
+        variants = [clause_term] if not expand else list(rules.candidates(clause_term))
+        best = None
+        for variant_index, variant in enumerate(variants):
+            for position in field_postings.get(variant, []):
+                if position <= after or position in used:
+                    continue
+                rank = (position, 0 if variant == clause_term else 1, variant_index)
+                if best is None or rank < best:
+                    best = rank + (variant,)
+        if best is None:
+            return None
+        return best[3], best[0]
+
+    def _doc_term_chain(self, field_postings, clause, rules):
+        chain: List[TermHit] = []
+        used: set[int] = set()
+        for term in clause.terms:
+            found = self._doc_find_token(
+                field_postings, term, clause.expand, rules, -1, used
+            )
+            if found is None:
+                return None
+            matched_as, position = found
+            used.add(position)
+            chain.append(TermHit(term, matched_as, position))
+        return chain
+
+    def _doc_phrase_chains(self, field_postings, clause, rules):
+        chains: List[List[TermHit]] = []
+
+        def extend(chain, used, term_index, spent):
+            if term_index == len(clause.terms):
+                chains.append(list(chain))
+                return
+            term = clause.terms[term_index]
+            last_pos = chain[-1].position if chain else -1
+            variants = [term] if not clause.expand else list(rules.candidates(term))
+            options = []
+            for variant in variants:
+                for position in field_postings.get(variant, []):
+                    if position <= last_pos or position in used:
+                        continue
+                    gap = position - last_pos - 1 if chain else 0
+                    if spent + gap <= clause.slop:
+                        options.append((position, 0 if variant == term else 1, variant))
+            options.sort(key=lambda item: (item[0], item[1]))
+            seen = set()
+            for position, _, variant in options:
+                if position in seen:
+                    continue
+                seen.add(position)
+                gap = position - last_pos - 1 if chain else 0
+                used.add(position)
+                chain.append(TermHit(term, variant, position))
+                extend(chain, used, term_index + 1, spent + gap)
+                chain.pop()
+                used.discard(position)
+
+        extend([], set(), 0, 0)
+        return chains
+
     def _field_index(self, document: StoredDocument) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
-        cache = getattr(self, "_token_cache", None)
-        if cache is None:
-            cache = {}
-            object.__setattr__(self, "_token_cache", cache) if False else setattr(self, "_token_cache", cache)
+        cache = self.__dict__.setdefault("_token_cache", {})
         indexed = cache.get(document.id)
         if indexed is None:
-            indexed = {
-                field: {
-                    term: [position for position, token in enumerate(tokens) if token == term]
-                    for term in set(tokens)
-                }
-                for field, tokens in field_tokens(document.fields).items()
-            }
-            # Fill positions for every term occurrence.
             indexed = {}
             for field, tokens in field_tokens(document.fields).items():
                 postings: Dict[str, List[int]] = {}
@@ -208,24 +281,6 @@ class SearchView:
                 indexed[field] = postings
             cache[document.id] = indexed
         return indexed
-
-    def _field_hit_from_postings(
-        self,
-        term_postings: Dict[str, Dict[str, List[int]]],
-        clause: Clause,
-        doc_id: str,
-        rules: SynonymRules,
-    ) -> Optional[ClauseHit]:
-        chains: List[List[TermHit]] = []
-        if clause.phrase:
-            chains = self._phrase_chains(term_postings, doc_id, clause, rules)
-        else:
-            chain = self._term_chain(term_postings, doc_id, clause, rules)
-            if chain is not None:
-                chains = [chain]
-        if not chains:
-            return None
-        return ClauseHit(clause, clause.field or "", self._choose_chain(chains))
 
     @staticmethod
     def excluded_rawhs(query: Query) -> List[str]:
