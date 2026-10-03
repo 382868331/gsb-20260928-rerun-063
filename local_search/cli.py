@@ -29,6 +29,32 @@ def main(argv: Sequence[str] | None = None) -> None:
     snapshot_search.add_argument("query")
     snapshot_search.add_argument("--limit", type=int)
 
+    research_new = commands.add_parser("research-new")
+    research_new.add_argument("name")
+    research_new.add_argument("queries_json", help='{"label": "query text", ...}')
+    research_new.add_argument("--mode", choices=["any", "all"], default="any")
+    research_new.add_argument("--budget", type=int)
+    research_page = commands.add_parser("research-page")
+    research_page.add_argument("name")
+    research_page.add_argument("--offset", type=int, default=0)
+    research_page.add_argument("--page-size", type=int)
+    research_status = commands.add_parser("research-status")
+    research_status.add_argument("name")
+    research_decide = commands.add_parser("research-decide")
+    research_decide.add_argument("name")
+    research_decide.add_argument("doc_id")
+    research_decide.add_argument("action", choices=["included", "excluded"])
+    research_decide.add_argument("reason")
+    research_continue = commands.add_parser("research-continue")
+    research_continue.add_argument("name")
+    research_continue.add_argument("--budget", type=int)
+    research_revise = commands.add_parser("research-revise")
+    research_revise.add_argument("name")
+    research_revise.add_argument("queries_json", nargs="?")
+    research_revise.add_argument("--mode", choices=["any", "all"])
+    research_revise.add_argument("--budget", type=int)
+    research_revise.add_argument("--new-name")
+
     args = parser.parse_args(argv)
     engine = SearchEngine(args.index)
 
@@ -50,6 +76,36 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(json.dumps(engine.publish_snapshot(args.name), ensure_ascii=False, indent=2))
     elif args.command == "snapshot-search":
         print(json.dumps(engine.search_snapshot(args.name, args.query, args.limit), ensure_ascii=False, indent=2))
+    elif args.command == "research-new":
+        research = engine.create_research_set(
+            args.name, json.loads(args.queries_json), mode=args.mode, budget=args.budget
+        )
+        print(json.dumps(research.review_status(), ensure_ascii=False, indent=2))
+    elif args.command == "research-page":
+        research = engine.open_research_set(args.name)
+        print(json.dumps(research.page(args.offset, args.page_size), ensure_ascii=False, indent=2))
+    elif args.command == "research-status":
+        print(json.dumps(engine.open_research_set(args.name).review_status(), ensure_ascii=False, indent=2))
+    elif args.command == "research-decide":
+        research = engine.open_research_set(args.name)
+        research.decide(args.doc_id, args.action, args.reason)
+        research.save()
+        print(json.dumps(research.review_status(), ensure_ascii=False, indent=2))
+    elif args.command == "research-continue":
+        research = engine.open_research_set(args.name)
+        research.continue_scan(args.budget)
+        research.save()
+        print(json.dumps(research.review_status(), ensure_ascii=False, indent=2))
+    elif args.command == "research-revise":
+        queries = None if args.queries_json is None else json.loads(args.queries_json)
+        report = engine.revise_research_set(
+            args.name,
+            queries,
+            mode=args.mode,
+            budget=args.budget,
+            new_name=args.new_name,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
