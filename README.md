@@ -147,6 +147,22 @@ report = research.merge_perspectives()
 research.resolve("d1", "excluded", "负责人复核：超出范围")
 ```
 
+研究者可以用 `decide_batch()` 给一次审阅批次指定稳定的 `batch_id`。之后只能由同一研究者撤回自己的当前意见，撤回必须填写原因；其他研究者意见不会被删除，负责人历史裁决也保留为证据。若当前或历史裁决引用了被撤回的意见，裁决会改为 `needs_review`（合并报告中的 `pending_review`），原结论、原因、引用和证据依据都原样保留；负责人重新 `resolve()` 后，旧裁决进入历史记录。
+
+```python
+alice.decide_batch([
+    ("d1", "included", "alice：命中核心定义"),
+    ("d2", "excluded", "alice：超出范围"),
+], batch_id="alice-20261005")
+research.withdraw_reviews(
+    "alice：发现证据来源有误",
+    "alice",
+    batch_id="alice-20261005",
+)
+```
+
+也可以在确保这些意见属于同一研究者的前提下，用 `doc_ids=[...]` 撤回指定的一批当前意见。撤回记录、被撤回意见快照以及待复核原因随 `save()` 保存；派生研究集只移除被撤回的本人意见，其他研究者和未依赖该批次的结论不受影响。
+
 索引更新后，`revise_research_set()`（查询不变时即派生新研究）逐视角继承：内容未变、证据签名仍相符的记录继承原决定（含已读位置，去重且不保留已删除文档）；内容变更的记录进入 `dropped_decisions`（`evidence_basis_changed`），已删除记录标记 `document_absent`，都要求重新审阅。解决决定只有在它引用的全部原判断都被继承时才随之继承。派生后的新研究集可以继续挂视角、再合并。
 
 ```bash
@@ -154,4 +170,6 @@ python -m local_search.cli --index ./data/index research-page study --page-size 
 python -m local_search.cli --index ./data/index research-decide study d1 excluded "无关" --perspective bob
 python -m local_search.cli --index ./data/index research-merge study
 python -m local_search.cli --index ./data/index research-resolve study d1 excluded "负责人复核"
+python -m local_search.cli --index ./data/index research-decide-batch study '[["d1","included","命中"],["d2","excluded","无关"]]' --perspective alice --batch alice-1
+python -m local_search.cli --index ./data/index research-withdraw study "证据有误" --perspective alice --batch alice-1
 ```

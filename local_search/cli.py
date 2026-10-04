@@ -48,6 +48,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     research_decide.add_argument("action", choices=["included", "excluded"])
     research_decide.add_argument("reason")
     research_decide.add_argument("--perspective")
+    research_decide.add_argument("--batch")
+    research_decide_batch = commands.add_parser("research-decide-batch")
+    research_decide_batch.add_argument("name")
+    research_decide_batch.add_argument("reviews_json", help='[["doc", "included", "reason"], ...]')
+    research_decide_batch.add_argument("--perspective")
+    research_decide_batch.add_argument("--batch")
+    research_withdraw = commands.add_parser("research-withdraw")
+    research_withdraw.add_argument("name")
+    research_withdraw.add_argument("reason")
+    research_withdraw.add_argument("--perspective")
+    research_withdraw.add_argument("--batch")
+    research_withdraw.add_argument("--doc-id", action="append", dest="doc_ids")
     research_merge = commands.add_parser("research-merge")
     research_merge.add_argument("name")
     research_merge.add_argument("--perspective", action="append", dest="perspectives")
@@ -106,9 +118,32 @@ def main(argv: Sequence[str] | None = None) -> None:
         research = engine.open_research_set(args.name)
         if args.perspective:
             research.add_perspective(args.perspective)
-        research.decide(args.doc_id, args.action, args.reason, args.perspective)
+        research.decide(args.doc_id, args.action, args.reason, args.perspective, batch_id=args.batch)
         research.save()
         print(json.dumps(research.review_status(args.perspective), ensure_ascii=False, indent=2))
+    elif args.command == "research-decide-batch":
+        research = engine.open_research_set(args.name)
+        if args.perspective:
+            research.add_perspective(args.perspective)
+        research.decide_batch(
+            [tuple(review) for review in json.loads(args.reviews_json)],
+            args.perspective,
+            batch_id=args.batch,
+        )
+        research.save()
+        print(json.dumps(research.review_status(args.perspective), ensure_ascii=False, indent=2))
+    elif args.command == "research-withdraw":
+        research = engine.open_research_set(args.name)
+        if args.perspective:
+            research.add_perspective(args.perspective)
+        result = research.withdraw_reviews(
+            args.reason,
+            args.perspective,
+            batch_id=args.batch,
+            doc_ids=args.doc_ids,
+        )
+        research.save()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "research-merge":
         research = engine.open_research_set(args.name)
         print(json.dumps(research.merge_perspectives(args.perspectives), ensure_ascii=False, indent=2))

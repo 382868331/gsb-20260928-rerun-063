@@ -19,6 +19,7 @@ references the original judgements.
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from uuid import uuid4
 
 from .pager import RankingOutcome, run_ranked
 from .query import parse_query
@@ -42,6 +43,10 @@ MERGE_CONFLICT = "conflict"
 MERGE_UNREVIEWED = "unreviewed"
 MERGE_PARTIAL = "partial"
 MERGE_RESOLVED = "resolved"
+MERGE_PENDING_REVIEW = "pending_review"
+
+ACTIVE = "active"
+NEEDS_REVIEW = "needs_review"
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,20 @@ class Decision:
     rules_version: Optional[int] = None
     inherited: bool = False
     references: List[dict] = field(default_factory=list)
+    decision_id: Optional[str] = None
+    batch_id: Optional[str] = None
+    status: str = ACTIVE
+    withdrawal_reasons: List[dict] = field(default_factory=list)
+    cited_decision_ids: List[str] = field(default_factory=list)
+
+
+@dataclass
+class WithdrawalBatch:
+    batch_id: str
+    perspective: str
+    reason: str
+    withdrawn_batch_id: Optional[str]
+    reviews: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -120,7 +139,7 @@ def _ranker_by_name(name: str, fallback: Ranker) -> Ranker:
 
 
 def _decision_payload(decision: Decision) -> dict:
-    return {
+    payload = {
         "action": decision.action,
         "reason": decision.reason,
         "basis": decision.basis,
@@ -128,6 +147,17 @@ def _decision_payload(decision: Decision) -> dict:
         "inherited": decision.inherited,
         "references": list(decision.references),
     }
+    if decision.decision_id is not None:
+        payload["decision_id"] = decision.decision_id
+    if decision.batch_id is not None:
+        payload["batch_id"] = decision.batch_id
+    if decision.status != ACTIVE:
+        payload["status"] = decision.status
+    if decision.withdrawal_reasons:
+        payload["withdrawal_reasons"] = list(decision.withdrawal_reasons)
+    if decision.cited_decision_ids:
+        payload["cited_decision_ids"] = list(decision.cited_decision_ids)
+    return payload
 
 
 def _decision_from_payload(entry: dict) -> Decision:
@@ -138,6 +168,31 @@ def _decision_from_payload(entry: dict) -> Decision:
         rules_version=entry.get("rules_version"),
         inherited=bool(entry.get("inherited", False)),
         references=list(entry.get("references", [])),
+        decision_id=entry.get("decision_id"),
+        batch_id=entry.get("batch_id"),
+        status=entry.get("status", ACTIVE),
+        withdrawal_reasons=list(entry.get("withdrawal_reasons", [])),
+        cited_decision_ids=list(entry.get("cited_decision_ids", [])),
+    )
+
+
+def _withdrawal_payload(withdrawal: WithdrawalBatch) -> dict:
+    return {
+        "withdrawal_id": withdrawal.batch_id,
+        "batch_id": withdrawal.withdrawn_batch_id,
+        "perspective": withdrawal.perspective,
+        "reason": withdrawal.reason,
+        "reviews": list(withdrawal.reviews),
+    }
+
+
+def _withdrawal_from_payload(entry: dict) -> WithdrawalBatch:
+    return WithdrawalBatch(
+        batch_id=entry.get("withdrawal_id") or entry["batch_id"],
+        perspective=entry["perspective"],
+        reason=entry["reason"],
+        withdrawn_batch_id=entry.get("batch_id"),
+        reviews=list(entry.get("reviews", [])),
     )
 
 
@@ -173,6 +228,8 @@ class ResearchSet:
             DEFAULT_PERSPECTIVE: Perspective(DEFAULT_PERSPECTIVE)
         }
         self.resolutions: Dict[str, Decision] = {}
+        self.resolution_history: Dict[str, List[Decision]] = {}
+        self.withdrawals: List[WithdrawalBatch] = []
         self.evidence: Dict[str, Dict[str, CandidateEvidence]] = {}
         self.outcomes: Dict[str, RankingOutcome] = {}
         self.exhausted = False
@@ -369,6 +426,11 @@ class ResearchSet:
             "manual_included": sorted(
                 doc_id for doc_id, decision in view.decisions.items() if decision.action == INCLUDED
             ),
+            "needs_re_resolution": sorted(
+                doc_id
+                for doc_id, decision in self.resolutions.items()
+                if decision.status == NEEDS_REVIEW
+            ),
             "pending_unscored": sorted(pending),
         }
 
@@ -378,6 +440,7 @@ class ResearchSet:
         action: str,
         reason: str,
         perspective: Optional[str] = None,
+        batch_id: Optional[str] = None,
     ) -> Decision:
         if action not in (INCLUDED, EXCLUDED):
             raise ValueError("decision action must be 'included' or 'excluded'")
@@ -393,9 +456,195 @@ class ResearchSet:
         }
         if not is_candidate and action != INCLUDED:
             raise ValueError("Only an inclusion exception can be recorded for a non-matching document")
-        decision = Decision(action, reason.strip(), basis, self.rules.version)
+        decision = Decision(
+            action,
+            reason.strip(),
+            basis,
+            self.rules.version,
+            decision_id=uuid4().hex,
+            batch_id=batch_id,
+        )
         view.decisions[doc_id] = decision
         return decision
+
+    def decide_batch(
+        self,
+        reviews: Sequence[Tuple[str, str, str]],
+        perspective: Optional[str] = None,
+        batch_id: Optional[str] = None,
+    ) -> dict:
+        """Record several opinions from one reviewer as one review batch."""
+        if not reviews:
+            raise ValueError("A review batch needs at least one review")
+        review_tuples = [(str(doc_id), action, reason) for doc_id, action, reason in reviews]
+        doc_ids = [doc_id for doc_id, _, _ in review_tuples]
+        if len(doc_ids) != len(set(doc_ids)):
+            raise ValueError("Review batch document ids must be unique")
+        for doc_id, action, reason in review_tuples:
+            if action not in (INCLUDED, EXCLUDED):
+                raise ValueError("decision action must be 'included' or 'excluded'")
+            if not reason or not reason.strip():
+                raise ValueError("A manual decision needs an explicit reason")
+            if doc_id not in self.documents:
+                raise KeyError(doc_id)
+            is_candidate, _ = self._membership(doc_id)
+            if not is_candidate and action != INCLUDED:
+                raise ValueError("Only an inclusion exception can be recorded for a non-matching document")
+        batch_id = batch_id or uuid4().hex
+        decisions = {
+            doc_id: self.decide(doc_id, action, reason, perspective, batch_id=batch_id)
+            for doc_id, action, reason in review_tuples
+        }
+        return {
+            "batch_id": batch_id,
+            "perspective": self._persp(perspective).name,
+            "decisions": decisions,
+        }
+
+    def withdraw_reviews(
+        self,
+        reason: str,
+        perspective: Optional[str] = None,
+        *,
+        batch_id: Optional[str] = None,
+        doc_ids: Optional[Sequence[str]] = None,
+        withdrawn_batch_id: Optional[str] = None,
+    ) -> dict:
+        """Withdraw one reviewer's current opinions in one audited batch."""
+        if not reason or not reason.strip():
+            raise ValueError("A withdrawal needs an explicit reason")
+        review_batch_id = batch_id if batch_id is not None else withdrawn_batch_id
+        if review_batch_id is None and not doc_ids:
+            raise ValueError("A withdrawal needs a review batch id or document ids")
+        view = self._persp(perspective)
+        selected_ids = [str(doc_id) for doc_id in doc_ids] if doc_ids is not None else []
+        if len(selected_ids) != len(set(selected_ids)):
+            raise ValueError("Withdrawal document ids must be unique")
+
+        removable: List[Tuple[str, Decision]] = []
+        for doc_id, decision in list(view.decisions.items()):
+            if decision.status != ACTIVE:
+                continue
+            if review_batch_id is not None and decision.batch_id != review_batch_id:
+                continue
+            if selected_ids and doc_id not in selected_ids:
+                continue
+            removable.append((doc_id, decision))
+        if not removable:
+            raise KeyError("No active reviews match the withdrawal selection")
+
+        matched_docs = {doc_id for doc_id, _ in removable}
+        missing = sorted(set(selected_ids) - matched_docs)
+        if missing:
+            raise KeyError("Some selected reviews do not belong to this reviewer and batch: " + ", ".join(missing))
+
+        withdrawal_id = uuid4().hex
+        reviews = [
+            {
+                "id": doc_id,
+                "action": decision.action,
+                "reason": decision.reason,
+                "decision_id": decision.decision_id,
+                "review_batch_id": decision.batch_id,
+            }
+            for doc_id, decision in sorted(removable)
+        ]
+        withdrawal = WithdrawalBatch(
+            batch_id=withdrawal_id,
+            perspective=view.name,
+            reason=reason.strip(),
+            withdrawn_batch_id=review_batch_id,
+            reviews=reviews,
+        )
+        self.withdrawals.append(withdrawal)
+        for doc_id, _ in removable:
+            del view.decisions[doc_id]
+        affected_resolutions = self._mark_resolutions_for_review(
+            view.name, matched_docs, withdrawal
+        )
+        return {
+            "withdrawal_id": withdrawal_id,
+            "batch_id": review_batch_id,
+            "perspective": view.name,
+            "withdrawn_ids": sorted(matched_docs),
+            "resolutions_needing_review": sorted(affected_resolutions),
+            "reason": reason.strip(),
+        }
+
+    def withdraw_batch(
+        self,
+        batch_id: str,
+        reason: Optional[str] = None,
+        perspective: Optional[str] = None,
+        *,
+        withdrawal_reason: Optional[str] = None,
+        doc_ids: Optional[Sequence[str]] = None,
+    ) -> dict:
+        actual_reason = reason or withdrawal_reason
+        if actual_reason is None:
+            raise ValueError("A withdrawal needs an explicit reason")
+        return self.withdraw_reviews(
+            actual_reason,
+            perspective,
+            batch_id=batch_id,
+            doc_ids=doc_ids,
+        )
+
+    def withdraw_review_batch(
+        self,
+        review_batch_id: str,
+        reason: str,
+        perspective: Optional[str] = None,
+    ) -> dict:
+        return self.withdraw_reviews(
+            reason,
+            perspective,
+            batch_id=review_batch_id,
+        )
+
+    def batch_withdraw(
+        self,
+        batch_id: str,
+        reason: str,
+        perspective: Optional[str] = None,
+    ) -> dict:
+        return self.withdraw_batch(batch_id, reason, perspective)
+
+    def _mark_resolutions_for_review(
+        self, perspective: str, doc_ids: set, withdrawal: WithdrawalBatch
+    ) -> set:
+        affected = set()
+        for doc_id in doc_ids:
+            review = next(entry for entry in withdrawal.reviews if entry["id"] == doc_id)
+            rulings = [self.resolutions.get(doc_id)] + list(self.resolution_history.get(doc_id, []))
+            for resolution in rulings:
+                if resolution is not None and self._resolution_cites_review(
+                    resolution, perspective, review
+                ):
+                    resolution.status = NEEDS_REVIEW
+                    resolution.withdrawal_reasons.append({
+                        "perspective": perspective,
+                        "reason": withdrawal.reason,
+                        "withdrawal_id": withdrawal.batch_id,
+                    })
+                    affected.add(doc_id)
+        return affected
+
+    @staticmethod
+    def _resolution_cites_review(resolution: Decision, perspective: str, review: dict) -> bool:
+        review_id = review.get("decision_id")
+        if review_id is not None:
+            return review_id in resolution.cited_decision_ids
+        if resolution.cited_decision_ids:
+            return False
+        if review_id in resolution.cited_decision_ids:
+            return True
+        return any(
+            ref.get("perspective") == perspective
+            and ref.get("action") == review.get("action")
+            and ref.get("reason") == review.get("reason")
+            for ref in resolution.references
+        )
 
     # ----------------------------------------------------- merging
     def merge_perspectives(self, names: Optional[Sequence[str]] = None) -> dict:
@@ -430,6 +679,7 @@ class ResearchSet:
             MERGE_UNREVIEWED: [],
             MERGE_PARTIAL: [],
             MERGE_RESOLVED: [],
+            MERGE_PENDING_REVIEW: [],
         }
         for doc_id in sorted(pool):
             decided = {
@@ -438,7 +688,9 @@ class ResearchSet:
                 if doc_id in view.decisions
             }
             resolution = self.resolutions.get(doc_id)
-            if resolution is not None:
+            if resolution is not None and resolution.status == NEEDS_REVIEW:
+                status = MERGE_PENDING_REVIEW
+            elif resolution is not None:
                 status = MERGE_RESOLVED
             elif not decided:
                 status = MERGE_UNREVIEWED
@@ -458,6 +710,8 @@ class ResearchSet:
                     {
                         "action": resolution.action,
                         "reason": resolution.reason,
+                        "status": resolution.status,
+                        "withdrawal_reasons": list(resolution.withdrawal_reasons),
                         "references": list(resolution.references),
                     }
                     if resolution is not None
@@ -472,6 +726,7 @@ class ResearchSet:
             "unreviewed": buckets[MERGE_UNREVIEWED],
             "partial": buckets[MERGE_PARTIAL],
             "resolved": buckets[MERGE_RESOLVED],
+            "pending_review": buckets[MERGE_PENDING_REVIEW],
         }
 
     def resolve(self, doc_id: str, action: str, reason: str) -> Decision:
@@ -492,22 +747,32 @@ class ResearchSet:
             for name, view in self.perspectives.items()
             if doc_id in view.decisions
         }
-        if len({decision.action for decision in decided.values()}) < 2:
-            raise ValueError("A resolution requires a real disagreement between perspectives")
+        previous = self.resolutions.get(doc_id)
+        real_disagreement = len({decision.action for decision in decided.values()}) >= 2
+        if not real_disagreement and (previous is None or previous.status != NEEDS_REVIEW):
+            raise ValueError("A resolution requires a real disagreement or a pending re-review")
         references = [
             {"perspective": name, "action": decision.action, "reason": decision.reason}
             for name, decision in sorted(decided.items())
+        ]
+        cited_decision_ids = [
+            decision.decision_id
+            for decision in decided.values()
+            if decision.decision_id is not None
         ]
         basis = {
             label: evidence.signature
             for label, evidence in self.evidence.get(doc_id, {}).items()
         }
+        if previous is not None:
+            self.resolution_history.setdefault(doc_id, []).append(previous)
         resolution = Decision(
             action,
             reason.strip(),
             basis,
             self.rules.version,
             references=references,
+            cited_decision_ids=cited_decision_ids,
         )
         self.resolutions[doc_id] = resolution
         return resolution
@@ -534,6 +799,7 @@ class ResearchSet:
                 ),
             }
         decision = view.decisions.get(doc_id)
+        resolution = self.resolutions.get(doc_id)
         return {
             "id": doc_id,
             "fields": dict(stored.fields),
@@ -542,6 +808,7 @@ class ResearchSet:
             "review": decision.action if decision is not None else PENDING_REVIEW,
             "review_reason": decision.reason if decision is not None else None,
             "reviewed": doc_id in view.read_ids,
+            "resolution_status": resolution.status if resolution is not None else None,
         }
 
 
@@ -580,6 +847,11 @@ class ResearchSet:
                 doc_id: _decision_payload(decision)
                 for doc_id, decision in self.resolutions.items()
             },
+            "resolution_history": {
+                doc_id: [_decision_payload(decision) for decision in decisions]
+                for doc_id, decisions in self.resolution_history.items()
+            },
+            "withdrawals": [_withdrawal_payload(entry) for entry in self.withdrawals],
         }
 
     def save(self) -> None:
@@ -616,6 +888,13 @@ class ResearchSet:
                 view.decisions[doc_id] = _decision_from_payload(entry)
         for doc_id, entry in payload.get("resolutions", {}).items():
             research.resolutions[doc_id] = _decision_from_payload(entry)
+        for doc_id, entries in payload.get("resolution_history", {}).items():
+            research.resolution_history[doc_id] = [
+                _decision_from_payload(entry) for entry in entries
+            ]
+        research.withdrawals = [
+            _withdrawal_from_payload(entry) for entry in payload.get("withdrawals", [])
+        ]
         return research
 
 
@@ -648,6 +927,38 @@ class PerspectiveView:
 
     def decide(self, doc_id: str, action: str, reason: str) -> Decision:
         return self.research.decide(doc_id, action, reason, self.name)
+
+    def decide_batch(self, reviews, batch_id: Optional[str] = None) -> dict:
+        return self.research.decide_batch(reviews, self.name, batch_id=batch_id)
+
+    def withdraw_reviews(
+        self,
+        reason: str,
+        *,
+        batch_id: Optional[str] = None,
+        doc_ids=None,
+        withdrawn_batch_id: Optional[str] = None,
+        ) -> dict:
+        return self.research.withdraw_reviews(
+            reason,
+            self.name,
+            batch_id=batch_id,
+            doc_ids=doc_ids,
+            withdrawn_batch_id=withdrawn_batch_id,
+        )
+
+    def withdraw_batch(self, batch_id: str, reason: str) -> dict:
+        return self.research.withdraw_batch(
+            batch_id,
+            reason,
+            self.name,
+        )
+
+    def batch_withdraw(self, batch_id: str, reason: str) -> dict:
+        return self.withdraw_batch(batch_id, reason)
+
+    def withdraw_review_batch(self, review_batch_id: str, reason: str) -> dict:
+        return self.research.withdraw_review_batch(review_batch_id, reason, self.name)
 
     def document_payload(self, doc_id: str) -> dict:
         return self.research.document_payload(doc_id, self.name)
@@ -786,6 +1097,7 @@ def _decision_basis_still_matches(
 def _inherit_decisions(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], List[dict]]:
     inherited: List[dict] = []
     dropped: List[dict] = []
+    new.withdrawals = list(old.withdrawals)
     for perspective_name, old_view in old.perspectives.items():
         new_view = new.add_perspective(perspective_name)
         # Surviving documents keep their read position; deleted documents
@@ -832,8 +1144,31 @@ def _inherit_decisions(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], 
                     "action": decision.action,
                     "reason": "evidence_basis_changed",
                 })
-    # Resolutions survive derivation only while every decision they cite is
-    # itself still inherited by the same perspective.
+    new.resolution_history = {
+        doc_id: [
+            Decision(
+                action=decision.action,
+                reason=decision.reason,
+                basis=dict(decision.basis),
+                rules_version=decision.rules_version,
+                inherited=True,
+                references=list(decision.references),
+                decision_id=decision.decision_id,
+                batch_id=decision.batch_id,
+                status=decision.status,
+                withdrawal_reasons=list(decision.withdrawal_reasons),
+                cited_decision_ids=list(decision.cited_decision_ids),
+            )
+            for decision in decisions
+            if doc_id in new.documents
+        ]
+        for doc_id, decisions in old.resolution_history.items()
+    }
+    new.resolution_history = {
+        doc_id: decisions for doc_id, decisions in new.resolution_history.items() if decisions
+    }
+    # Active resolutions survive derivation only while every decision they
+    # cite is itself still inherited by the same perspective.
     for doc_id, resolution in old.resolutions.items():
         if doc_id not in new.documents:
             dropped.append({
@@ -842,6 +1177,22 @@ def _inherit_decisions(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], 
                 "action": resolution.action,
                 "reason": "document_absent",
             })
+            continue
+        if resolution.status == NEEDS_REVIEW:
+            new.resolutions[doc_id] = Decision(
+                action=resolution.action,
+                reason=resolution.reason,
+                basis=dict(resolution.basis),
+                rules_version=resolution.rules_version,
+                inherited=True,
+                references=list(resolution.references),
+                decision_id=resolution.decision_id,
+                batch_id=resolution.batch_id,
+                status=NEEDS_REVIEW,
+                withdrawal_reasons=list(resolution.withdrawal_reasons),
+                cited_decision_ids=list(resolution.cited_decision_ids),
+            )
+            inherited.append({"id": doc_id, "perspective": None, "action": resolution.action})
             continue
         cited = {ref["perspective"] for ref in resolution.references}
         still_cited = all(
@@ -877,6 +1228,7 @@ def _inherit_decisions(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], 
             rules_version=new.rules.version,
             inherited=True,
             references=list(resolution.references),
+            cited_decision_ids=list(resolution.cited_decision_ids),
         )
         inherited.append({"id": doc_id, "perspective": None, "action": resolution.action})
     return inherited, dropped
