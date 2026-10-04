@@ -16,7 +16,7 @@ never settled by overwriting, only by an explicit resolution decision that
 references the original judgements.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -42,6 +42,11 @@ MERGE_CONFLICT = "conflict"
 MERGE_UNREVIEWED = "unreviewed"
 MERGE_PARTIAL = "partial"
 MERGE_RESOLVED = "resolved"
+MERGE_RECHECK = "recheck"
+
+DECISION_ACTIVE = "active"
+DECISION_WITHDRAWN = "withdrawn"
+RESOLUTION_PENDING_RECHECK = "pending_recheck"
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,18 @@ class Decision:
     rules_version: Optional[int] = None
     inherited: bool = False
     references: List[dict] = field(default_factory=list)
+    status: str = DECISION_ACTIVE
+    withdrawal_batches: List[str] = field(default_factory=list)
+
+
+@dataclass
+class WithdrawalBatch:
+    """One researcher's atomic withdrawal of several own decisions."""
+
+    batch_id: str
+    perspective: str
+    reason: str
+    decisions: Dict[str, Decision] = field(default_factory=dict)
 
 
 @dataclass
@@ -127,6 +144,8 @@ def _decision_payload(decision: Decision) -> dict:
         "rules_version": decision.rules_version,
         "inherited": decision.inherited,
         "references": list(decision.references),
+        "status": decision.status,
+        "withdrawal_batches": list(decision.withdrawal_batches),
     }
 
 
@@ -138,6 +157,32 @@ def _decision_from_payload(entry: dict) -> Decision:
         rules_version=entry.get("rules_version"),
         inherited=bool(entry.get("inherited", False)),
         references=list(entry.get("references", [])),
+        status=entry.get("status", DECISION_ACTIVE),
+        withdrawal_batches=list(entry.get("withdrawal_batches", [])),
+    )
+
+
+def _withdrawal_payload(batch: WithdrawalBatch) -> dict:
+    return {
+        "batch_id": batch.batch_id,
+        "perspective": batch.perspective,
+        "reason": batch.reason,
+        "decisions": {
+            doc_id: _decision_payload(decision)
+            for doc_id, decision in batch.decisions.items()
+        },
+    }
+
+
+def _withdrawal_from_payload(entry: dict) -> WithdrawalBatch:
+    return WithdrawalBatch(
+        batch_id=entry["batch_id"],
+        perspective=entry["perspective"],
+        reason=entry["reason"],
+        decisions={
+            doc_id: _decision_from_payload(payload)
+            for doc_id, payload in entry.get("decisions", {}).items()
+        },
     )
 
 
@@ -173,6 +218,8 @@ class ResearchSet:
             DEFAULT_PERSPECTIVE: Perspective(DEFAULT_PERSPECTIVE)
         }
         self.resolutions: Dict[str, Decision] = {}
+        self.resolution_history: Dict[str, List[Decision]] = {}
+        self.withdrawals: Dict[str, WithdrawalBatch] = {}
         self.evidence: Dict[str, Dict[str, CandidateEvidence]] = {}
         self.outcomes: Dict[str, RankingOutcome] = {}
         self.exhausted = False
@@ -282,16 +329,18 @@ class ResearchSet:
         candidate_pool = set(self.evidence) | {
             doc_id
             for doc_id, decision in view.decisions.items()
-            if decision.action == INCLUDED
+            if decision.status == DECISION_ACTIVE and decision.action == INCLUDED
         }
         for doc_id in sorted(candidate_pool):
             is_candidate, fully = self._membership(doc_id)
             decision = view.decisions.get(doc_id)
             if not is_candidate and decision is None:
                 continue
-            if decision is not None and decision.action == EXCLUDED:
+            if decision is not None and decision.status == DECISION_ACTIVE and decision.action == EXCLUDED:
                 continue
-            if not is_candidate and decision.action != INCLUDED:
+            if not is_candidate and (
+                decision is None or decision.status != DECISION_ACTIVE or decision.action != INCLUDED
+            ):
                 continue
             (evaluated if fully else pending).append(doc_id)
         evaluated.sort(key=self._combined_key)
@@ -364,12 +413,26 @@ class ResearchSet:
             "reviewed": [doc_id for doc_id in view.read_ids if doc_id in current],
             "unreviewed": self.unreviewed(perspective),
             "excluded": sorted(
-                doc_id for doc_id, decision in view.decisions.items() if decision.action == EXCLUDED
+                doc_id
+                for doc_id, decision in view.decisions.items()
+                if decision.status == DECISION_ACTIVE and decision.action == EXCLUDED
             ),
             "manual_included": sorted(
-                doc_id for doc_id, decision in view.decisions.items() if decision.action == INCLUDED
+                doc_id
+                for doc_id, decision in view.decisions.items()
+                if decision.status == DECISION_ACTIVE and decision.action == INCLUDED
+            ),
+            "withdrawn": sorted(
+                doc_id
+                for doc_id, decision in view.decisions.items()
+                if decision.status == DECISION_WITHDRAWN
             ),
             "pending_unscored": sorted(pending),
+            "recheck_resolutions": sorted(
+                doc_id
+                for doc_id, resolution in self.resolutions.items()
+                if resolution.status == RESOLUTION_PENDING_RECHECK
+            ),
         }
 
     def decide(
@@ -397,6 +460,77 @@ class ResearchSet:
         view.decisions[doc_id] = decision
         return decision
 
+    def withdraw_decisions(
+        self,
+        doc_ids: Sequence[str],
+        reason: str,
+        perspective: Optional[str] = None,
+        *,
+        batch_id: Optional[str] = None,
+    ) -> WithdrawalBatch:
+        """Atomically withdraw one perspective's own active decisions."""
+        view = self._persp(perspective)
+        if not doc_ids:
+            raise ValueError("A withdrawal batch needs at least one document")
+        if not reason or not reason.strip():
+            raise ValueError("A withdrawal needs an explicit reason")
+        unique_ids = list(dict.fromkeys(doc_ids))
+        missing = [doc_id for doc_id in unique_ids if doc_id not in view.decisions]
+        if missing:
+            raise KeyError("No active review from this perspective for: " + ", ".join(missing))
+        already_withdrawn = [
+            doc_id
+            for doc_id in unique_ids
+            if view.decisions[doc_id].status != DECISION_ACTIVE
+        ]
+        if already_withdrawn:
+            raise ValueError("Already withdrawn: " + ", ".join(already_withdrawn))
+
+        if batch_id is None:
+            sequence = len(self.withdrawals) + 1
+            batch_id = f"withdrawal-{sequence}"
+            while batch_id in self.withdrawals:
+                sequence += 1
+                batch_id = f"withdrawal-{sequence}"
+        if not batch_id or batch_id in self.withdrawals:
+            raise ValueError("Withdrawal batch id must be unique and non-empty")
+
+        archived = {
+            doc_id: replace(
+                view.decisions[doc_id],
+                status=DECISION_WITHDRAWN,
+                withdrawal_batches=[*view.decisions[doc_id].withdrawal_batches, batch_id],
+            )
+            for doc_id in unique_ids
+        }
+        batch = WithdrawalBatch(batch_id, view.name, reason.strip(), archived)
+        self.withdrawals[batch_id] = batch
+        for doc_id, decision in archived.items():
+            view.decisions[doc_id] = decision
+        affected = set(unique_ids)
+        for doc_id, resolution in list(self.resolutions.items()):
+            if doc_id not in affected:
+                continue
+            cited = {ref.get("perspective") for ref in resolution.references}
+            if view.name not in cited:
+                continue
+            self.resolution_history.setdefault(doc_id, []).append(resolution)
+            self.resolutions[doc_id] = replace(
+                resolution,
+                status=RESOLUTION_PENDING_RECHECK,
+                references=[
+                    {
+                        **ref,
+                        "withdrawn_batch": batch_id,
+                        "withdrawn_reason": batch.reason,
+                    }
+                    if ref.get("perspective") == view.name
+                    else dict(ref)
+                    for ref in resolution.references
+                ],
+            )
+        return batch
+
     # ----------------------------------------------------- merging
     def merge_perspectives(self, names: Optional[Sequence[str]] = None) -> dict:
         """Merge review perspectives without overwriting any judgement.
@@ -416,7 +550,9 @@ class ResearchSet:
             active = [
                 name
                 for name, view in self.perspectives.items()
-                if view.read_ids or view.decisions
+                if view.read_ids or any(
+                    decision.status == DECISION_ACTIVE for decision in view.decisions.values()
+                )
             ]
             selected = active or list(self.perspectives)
         views = [self._persp(name) for name in selected]
@@ -430,15 +566,23 @@ class ResearchSet:
             MERGE_UNREVIEWED: [],
             MERGE_PARTIAL: [],
             MERGE_RESOLVED: [],
+            MERGE_RECHECK: [],
         }
+        for batch in self.withdrawals.values():
+            pool |= set(batch.decisions)
         for doc_id in sorted(pool):
             decided = {
-                view.name: {"action": view.decisions[doc_id].action, "reason": view.decisions[doc_id].reason}
+                view.name: {
+                    "action": view.decisions[doc_id].action,
+                    "reason": view.decisions[doc_id].reason,
+                }
                 for view in views
-                if doc_id in view.decisions
+                if doc_id in view.decisions and view.decisions[doc_id].status == DECISION_ACTIVE
             }
             resolution = self.resolutions.get(doc_id)
-            if resolution is not None:
+            if resolution is not None and resolution.status == RESOLUTION_PENDING_RECHECK:
+                status = MERGE_RECHECK
+            elif resolution is not None:
                 status = MERGE_RESOLVED
             elif not decided:
                 status = MERGE_UNREVIEWED
@@ -459,6 +603,7 @@ class ResearchSet:
                         "action": resolution.action,
                         "reason": resolution.reason,
                         "references": list(resolution.references),
+                        "status": resolution.status,
                     }
                     if resolution is not None
                     else None
@@ -472,6 +617,19 @@ class ResearchSet:
             "unreviewed": buckets[MERGE_UNREVIEWED],
             "partial": buckets[MERGE_PARTIAL],
             "resolved": buckets[MERGE_RESOLVED],
+            "recheck": buckets[MERGE_RECHECK],
+            "resolution_history": {
+                doc_id: [
+                    {
+                        "action": decision.action,
+                        "reason": decision.reason,
+                        "references": list(decision.references),
+                        "status": decision.status,
+                    }
+                    for decision in history
+                ]
+                for doc_id, history in self.resolution_history.items()
+            },
         }
 
     def resolve(self, doc_id: str, action: str, reason: str) -> Decision:
@@ -490,12 +648,19 @@ class ResearchSet:
         decided = {
             name: view.decisions[doc_id]
             for name, view in self.perspectives.items()
-            if doc_id in view.decisions
+            if doc_id in view.decisions and view.decisions[doc_id].status == DECISION_ACTIVE
         }
-        if len({decision.action for decision in decided.values()}) < 2:
+        existing = self.resolutions.get(doc_id)
+        if existing is not None and existing.status != RESOLUTION_PENDING_RECHECK:
+            raise ValueError("An active resolution can only change after recheck")
+        if existing is None and len({decision.action for decision in decided.values()}) < 2:
             raise ValueError("A resolution requires a real disagreement between perspectives")
         references = [
-            {"perspective": name, "action": decision.action, "reason": decision.reason}
+            {
+                "perspective": name,
+                "action": decision.action,
+                "reason": decision.reason,
+            }
             for name, decision in sorted(decided.items())
         ]
         basis = {
@@ -509,6 +674,8 @@ class ResearchSet:
             self.rules.version,
             references=references,
         )
+        if existing is not None:
+            self.resolution_history.setdefault(doc_id, []).append(existing)
         self.resolutions[doc_id] = resolution
         return resolution
 
@@ -534,13 +701,27 @@ class ResearchSet:
                 ),
             }
         decision = view.decisions.get(doc_id)
+        withdrawal = None
+        if decision is not None and decision.status == DECISION_WITHDRAWN:
+            batch_id = decision.withdrawal_batches[-1] if decision.withdrawal_batches else None
+            batch = self.withdrawals.get(batch_id) if batch_id else None
+            withdrawal = {
+                "batch_id": batch_id,
+                "reason": batch.reason if batch is not None else None,
+            }
         return {
             "id": doc_id,
             "fields": dict(stored.fields),
             "matched_queries": sorted(self.evidence.get(doc_id, {})),
             "per_query": per_query,
-            "review": decision.action if decision is not None else PENDING_REVIEW,
+            "review": (
+                decision.action
+                if decision is not None and decision.status == DECISION_ACTIVE
+                else DECISION_WITHDRAWN if decision is not None
+                else PENDING_REVIEW
+            ),
             "review_reason": decision.reason if decision is not None else None,
+            "withdrawal": withdrawal,
             "reviewed": doc_id in view.read_ids,
         }
 
@@ -580,6 +761,14 @@ class ResearchSet:
                 doc_id: _decision_payload(decision)
                 for doc_id, decision in self.resolutions.items()
             },
+            "resolution_history": {
+                doc_id: [_decision_payload(decision) for decision in history]
+                for doc_id, history in self.resolution_history.items()
+            },
+            "withdrawals": {
+                batch_id: _withdrawal_payload(batch)
+                for batch_id, batch in self.withdrawals.items()
+            },
         }
 
     def save(self) -> None:
@@ -616,6 +805,12 @@ class ResearchSet:
                 view.decisions[doc_id] = _decision_from_payload(entry)
         for doc_id, entry in payload.get("resolutions", {}).items():
             research.resolutions[doc_id] = _decision_from_payload(entry)
+        for doc_id, entries in payload.get("resolution_history", {}).items():
+            research.resolution_history[doc_id] = [
+                _decision_from_payload(entry) for entry in entries
+            ]
+        for batch_id, entry in payload.get("withdrawals", {}).items():
+            research.withdrawals[batch_id] = _withdrawal_from_payload(entry)
         return research
 
 
@@ -648,6 +843,9 @@ class PerspectiveView:
 
     def decide(self, doc_id: str, action: str, reason: str) -> Decision:
         return self.research.decide(doc_id, action, reason, self.name)
+
+    def withdraw_decisions(self, doc_ids: Sequence[str], reason: str) -> WithdrawalBatch:
+        return self.research.withdraw_decisions(doc_ids, reason, self.name)
 
     def document_payload(self, doc_id: str) -> dict:
         return self.research.document_payload(doc_id, self.name)
@@ -812,26 +1010,36 @@ def _inherit_decisions(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], 
                     for label in decision.basis
                     if label in new_evidence
                 }
-                inherited_decision = Decision(
-                    action=decision.action,
-                    reason=decision.reason,
+                inherited_decision = replace(
+                    decision,
                     basis=basis or decision.basis,
                     rules_version=new.rules.version,
                     inherited=True,
                 )
                 new_view.decisions[doc_id] = inherited_decision
-                inherited.append({
-                    "id": doc_id,
-                    "perspective": perspective_name,
-                    "action": decision.action,
-                })
+                if decision.status == DECISION_ACTIVE:
+                    inherited.append({
+                        "id": doc_id,
+                        "perspective": perspective_name,
+                        "action": decision.action,
+                    })
             else:
-                dropped.append({
-                    "id": doc_id,
-                    "perspective": perspective_name,
-                    "action": decision.action,
-                    "reason": "evidence_basis_changed",
-                })
+                if decision.status == DECISION_ACTIVE:
+                    dropped.append({
+                        "id": doc_id,
+                        "perspective": perspective_name,
+                        "action": decision.action,
+                        "reason": "evidence_basis_changed",
+                    })
+    for batch_id, batch in old.withdrawals.items():
+        new.withdrawals[batch_id] = replace(
+            batch,
+            decisions={
+                doc_id: replace(decision, inherited=True)
+                for doc_id, decision in batch.decisions.items()
+                if doc_id in new.documents and _decision_basis_still_matches(old, new, doc_id, decision)
+            },
+        )
     # Resolutions survive derivation only while every decision they cite is
     # itself still inherited by the same perspective.
     for doc_id, resolution in old.resolutions.items():
@@ -844,10 +1052,15 @@ def _inherit_decisions(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], 
             })
             continue
         cited = {ref["perspective"] for ref in resolution.references}
-        still_cited = all(
-            doc_id in new.perspectives.get(name, Perspective(name)).decisions
-            for name in cited
-        )
+        def cited_decision_is_available(name: str) -> bool:
+            decision = new.perspectives.get(name, Perspective(name)).decisions.get(doc_id)
+            if decision is not None and decision.status == DECISION_ACTIVE:
+                return True
+            return any(
+                batch.perspective == name and doc_id in batch.decisions
+                for batch in new.withdrawals.values()
+            )
+        still_cited = all(cited_decision_is_available(name) for name in cited)
         if not still_cited:
             dropped.append({
                 "id": doc_id,
@@ -870,13 +1083,24 @@ def _inherit_decisions(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], 
             for label in resolution.basis
             if label in new_evidence
         }
-        new.resolutions[doc_id] = Decision(
-            action=resolution.action,
-            reason=resolution.reason,
+        inherited_resolution = replace(
+            resolution,
             basis=basis or resolution.basis,
             rules_version=new.rules.version,
             inherited=True,
             references=list(resolution.references),
         )
-        inherited.append({"id": doc_id, "perspective": None, "action": resolution.action})
+        new.resolutions[doc_id] = inherited_resolution
+        new.resolution_history[doc_id] = [
+            replace(history, inherited=True) for history in old.resolution_history.get(doc_id, [])
+        ]
+        if inherited_resolution.status == DECISION_ACTIVE:
+            inherited.append({"id": doc_id, "perspective": None, "action": resolution.action})
+        else:
+            inherited.append({
+                "id": doc_id,
+                "perspective": None,
+                "action": resolution.action,
+                "recheck": True,
+            })
     return inherited, dropped

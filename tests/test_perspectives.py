@@ -5,6 +5,8 @@ from pathlib import Path
 from local_search.engine import SearchEngine
 from local_search.ranking import ConstantScoreRanker
 from local_search.research import (
+    DECISION_WITHDRAWN,
+    MERGE_RECHECK,
     MERGE_CONFLICT,
     MERGE_CONSENSUS,
     MERGE_PARTIAL,
@@ -133,6 +135,82 @@ class PerspectiveTest(unittest.TestCase):
         reopened = self.engine.open_research_set("rs")
         self.assertEqual(reopened.resolutions["d1"].reason, "lead reviewer: out of scope")
         self.assertEqual(len(reopened.resolutions["d1"].references), 2)
+
+    def test_batch_withdrawal_is_scoped_and_marks_cited_resolution_recheck(self) -> None:
+        research = self.make_set()
+        alice = research.perspective("alice")
+        bob = research.perspective("bob")
+        carol = research.perspective("carol")
+        alice.decide("d1", "included", "alice: keep d1")
+        bob.decide("d1", "included", "bob: keep d1")
+        alice.decide("d2", "included", "alice: keep d2")
+        bob.decide("d2", "excluded", "bob: drop d2")
+        alice.decide("d3", "included", "alice: keep d3")
+        carol.decide("d3", "excluded", "carol: drop d3")
+        research.resolve("d2", "included", "lead: accepted alice")
+        research.resolve("d3", "excluded", "lead: accepted carol")
+
+        batch = alice.withdraw_decisions(["d1", "d2"], "alice: source was misread")
+        self.assertEqual(sorted(batch.decisions), ["d1", "d2"])
+        self.assertEqual(alice.document_payload("d1")["review"], DECISION_WITHDRAWN)
+        self.assertEqual(alice.document_payload("d1")["review_reason"], "alice: keep d1")
+        self.assertEqual(alice.document_payload("d1")["withdrawal"]["reason"], "alice: source was misread")
+        # Other researchers' opinions and an unrelated lead decision stay active.
+        self.assertEqual(bob.document_payload("d1")["review"], "included")
+        self.assertEqual(research.perspectives["alice"].decisions["d3"].action, "included")
+        self.assertEqual(research.resolutions["d3"].status, "active")
+        merged = research.merge_perspectives()
+        by_id = {entry["id"]: entry for entry in merged["documents"]}
+        self.assertEqual(by_id["d2"]["status"], MERGE_RECHECK)
+        self.assertEqual(by_id["d2"]["resolution"]["action"], "included")
+        self.assertEqual(
+            by_id["d2"]["resolution"]["references"][0]["reason"],
+            "alice: keep d2",
+        )
+        self.assertEqual(by_id["d3"]["status"], "resolved")
+        self.assertEqual(merged["recheck"], ["d2"])
+        self.assertEqual(merged["resolution_history"]["d2"][0]["status"], "active")
+
+        research.save()
+        reopened = self.engine.open_research_set("rs")
+        self.assertEqual(reopened.withdrawals[batch.batch_id].reason, "alice: source was misread")
+        self.assertEqual(
+            reopened.perspectives["alice"].decisions["d2"].status,
+            DECISION_WITHDRAWN,
+        )
+        self.assertEqual(reopened.resolutions["d2"].status, "pending_recheck")
+        self.assertEqual(reopened.resolution_history["d2"][0].reason, "lead: accepted alice")
+
+    def test_withdrawal_batch_propagates_only_to_dependent_derived_conclusions(self) -> None:
+        old = self.make_set()
+        alice = old.perspective("alice")
+        bob = old.perspective("bob")
+        carol = old.perspective("carol")
+        alice.decide("d1", "included", "alice: d1")
+        bob.decide("d1", "included", "bob: d1")
+        alice.decide("d2", "included", "alice: d2")
+        bob.decide("d2", "excluded", "bob: d2")
+        alice.decide("d3", "included", "alice: d3")
+        carol.decide("d3", "excluded", "carol: d3")
+        old.resolve("d2", "included", "lead: d2")
+        old.resolve("d3", "excluded", "lead: d3")
+        batch = alice.withdraw_decisions(["d1", "d2"], "alice: withdrawn")
+        old.save()
+
+        report = self.engine.revise_research_set("rs", new_name="derived")
+        inherited = {(entry["id"], entry.get("recheck", False)) for entry in report["inherited_decisions"]}
+        self.assertIn(("d2", True), inherited)
+        self.assertIn(("d3", False), inherited)
+        derived = self.engine.open_research_set("derived")
+        self.assertIn(batch.batch_id, derived.withdrawals)
+        self.assertEqual(
+            derived.perspectives["alice"].decisions["d1"].status,
+            DECISION_WITHDRAWN,
+        )
+        self.assertEqual(derived.perspectives["bob"].decisions["d1"].status, "active")
+        self.assertEqual(derived.resolutions["d2"].status, "pending_recheck")
+        self.assertEqual(derived.resolutions["d3"].status, "active")
+        self.assertEqual(derived.resolution_history["d2"][0].references[0]["reason"], "alice: d2")
 
     def test_derive_after_index_update_then_merge(self) -> None:
         old = self.make_set()

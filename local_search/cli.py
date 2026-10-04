@@ -48,6 +48,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     research_decide.add_argument("action", choices=["included", "excluded"])
     research_decide.add_argument("reason")
     research_decide.add_argument("--perspective")
+    research_withdraw = commands.add_parser("research-withdraw")
+    research_withdraw.add_argument("name")
+    research_withdraw.add_argument("doc_ids_json", help='["doc-id-1", "doc-id-2"]')
+    research_withdraw.add_argument("reason")
+    research_withdraw.add_argument("--perspective", required=True)
+    research_withdraw.add_argument("--batch-id")
     research_merge = commands.add_parser("research-merge")
     research_merge.add_argument("name")
     research_merge.add_argument("--perspective", action="append", dest="perspectives")
@@ -109,6 +115,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         research.decide(args.doc_id, args.action, args.reason, args.perspective)
         research.save()
         print(json.dumps(research.review_status(args.perspective), ensure_ascii=False, indent=2))
+    elif args.command == "research-withdraw":
+        research = engine.open_research_set(args.name)
+        research.add_perspective(args.perspective)
+        batch = research.withdraw_decisions(
+            json.loads(args.doc_ids_json),
+            args.reason,
+            args.perspective,
+            batch_id=args.batch_id,
+        )
+        research.save()
+        print(json.dumps({
+            "batch_id": batch.batch_id,
+            "perspective": batch.perspective,
+            "reason": batch.reason,
+            "doc_ids": sorted(batch.decisions),
+            "status": research.review_status(args.perspective),
+            "merge": research.merge_perspectives(),
+        }, ensure_ascii=False, indent=2))
     elif args.command == "research-merge":
         research = engine.open_research_set(args.name)
         print(json.dumps(research.merge_perspectives(args.perspectives), ensure_ascii=False, indent=2))

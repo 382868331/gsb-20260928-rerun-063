@@ -147,11 +147,26 @@ report = research.merge_perspectives()
 research.resolve("d1", "excluded", "负责人复核：超出范围")
 ```
 
-索引更新后，`revise_research_set()`（查询不变时即派生新研究）逐视角继承：内容未变、证据签名仍相符的记录继承原决定（含已读位置，去重且不保留已删除文档）；内容变更的记录进入 `dropped_decisions`（`evidence_basis_changed`），已删除记录标记 `document_absent`，都要求重新审阅。解决决定只有在它引用的全部原判断都被继承时才随之继承。派生后的新研究集可以继续挂视角、再合并。
+研究者可以一次性撤回自己的多条意见，撤回必须填写原因，并且只会撤回指定视角自己的当前意见；其他研究者意见和负责人裁决都不会被删除。撤回的原意见进入撤回批次归档，当前页面与状态不再把它当作有效排除/纳入依据：
+
+```python
+alice = research.perspective("alice")
+batch = alice.withdraw_decisions(
+    ["d1", "d7"],
+    "重新核对来源后发现单位和时间范围判断错误",
+)
+batch.batch_id
+research.save()
+```
+
+如果负责人历史裁决的 `references` 引用了该批次中的意见，该裁决不会被删除，而是标记为 `pending_recheck`；裁决动作、原因、证据签名和原始引用都继续保留在当前裁决与 `resolution_history` 中。`merge_perspectives()` 会把这类文档归入 `recheck`，`review_status()` 的 `recheck_resolutions` 也会列出待复核清单。负责人完成复核后可再次调用 `resolve()` 写入新裁决，旧裁决仍作为历史依据保留。
+
+索引更新后，`revise_research_set()`（查询不变时即派生新研究）逐视角继承：内容未变、证据签名仍相符的记录继承原决定（含已读位置，去重且不保留已删除文档）；内容变更的记录进入 `dropped_decisions`（`evidence_basis_changed`），已删除记录标记 `document_absent`，都要求重新审阅。解决决定只有在它引用的全部原判断都仍可用（有效或属于匹配的撤回批次）且证据签名仍相符时才随之继承；引用撤回意见的裁决以 `pending_recheck` 状态继承，无关裁决保持有效。撤回批次会随派生集保存，但影响范围仅限批次内意见和实际引用这些意见的结论。派生后的新研究集可以继续挂视角、再合并。
 
 ```bash
 python -m local_search.cli --index ./data/index research-page study --page-size 20 --perspective alice
 python -m local_search.cli --index ./data/index research-decide study d1 excluded "无关" --perspective bob
 python -m local_search.cli --index ./data/index research-merge study
 python -m local_search.cli --index ./data/index research-resolve study d1 excluded "负责人复核"
+python -m local_search.cli --index ./data/index research-withdraw study '["d1","d7"]' "来源复核后撤回" --perspective alice
 ```
