@@ -38,13 +38,24 @@ def main(argv: Sequence[str] | None = None) -> None:
     research_page.add_argument("name")
     research_page.add_argument("--offset", type=int, default=0)
     research_page.add_argument("--page-size", type=int)
+    research_page.add_argument("--perspective")
     research_status = commands.add_parser("research-status")
     research_status.add_argument("name")
+    research_status.add_argument("--perspective")
     research_decide = commands.add_parser("research-decide")
     research_decide.add_argument("name")
     research_decide.add_argument("doc_id")
     research_decide.add_argument("action", choices=["included", "excluded"])
     research_decide.add_argument("reason")
+    research_decide.add_argument("--perspective")
+    research_merge = commands.add_parser("research-merge")
+    research_merge.add_argument("name")
+    research_merge.add_argument("--perspective", action="append", dest="perspectives")
+    research_resolve = commands.add_parser("research-resolve")
+    research_resolve.add_argument("name")
+    research_resolve.add_argument("doc_id")
+    research_resolve.add_argument("action", choices=["included", "excluded"])
+    research_resolve.add_argument("reason")
     research_continue = commands.add_parser("research-continue")
     research_continue.add_argument("name")
     research_continue.add_argument("--budget", type=int)
@@ -83,14 +94,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         print(json.dumps(research.review_status(), ensure_ascii=False, indent=2))
     elif args.command == "research-page":
         research = engine.open_research_set(args.name)
-        print(json.dumps(research.page(args.offset, args.page_size), ensure_ascii=False, indent=2))
+        if args.perspective:
+            research.add_perspective(args.perspective)
+        print(json.dumps(research.page(args.offset, args.page_size, args.perspective), ensure_ascii=False, indent=2))
     elif args.command == "research-status":
-        print(json.dumps(engine.open_research_set(args.name).review_status(), ensure_ascii=False, indent=2))
+        research = engine.open_research_set(args.name)
+        if args.perspective:
+            research.add_perspective(args.perspective)
+        print(json.dumps(research.review_status(args.perspective), ensure_ascii=False, indent=2))
     elif args.command == "research-decide":
         research = engine.open_research_set(args.name)
-        research.decide(args.doc_id, args.action, args.reason)
+        if args.perspective:
+            research.add_perspective(args.perspective)
+        research.decide(args.doc_id, args.action, args.reason, args.perspective)
         research.save()
-        print(json.dumps(research.review_status(), ensure_ascii=False, indent=2))
+        print(json.dumps(research.review_status(args.perspective), ensure_ascii=False, indent=2))
+    elif args.command == "research-merge":
+        research = engine.open_research_set(args.name)
+        print(json.dumps(research.merge_perspectives(args.perspectives), ensure_ascii=False, indent=2))
+    elif args.command == "research-resolve":
+        research = engine.open_research_set(args.name)
+        research.resolve(args.doc_id, args.action, args.reason)
+        research.save()
+        print(json.dumps(research.merge_perspectives(), ensure_ascii=False, indent=2))
     elif args.command == "research-continue":
         research = engine.open_research_set(args.name)
         research.continue_scan(args.budget)

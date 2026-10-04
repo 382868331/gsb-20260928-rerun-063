@@ -1,11 +1,12 @@
 from .engine import SearchEngine
 from .query import Query
-from .research import QuerySpec, ResearchSet, compare_research_sets
+from .research import PerspectiveView, QuerySpec, ResearchSet, compare_research_sets
 from .synonyms import SynonymRules, SynonymRulesBuilder
 from .view import SearchView
 
 __all__ = [
     "SearchEngine",
+    "PerspectiveView",
     "Query",
     "QuerySpec",
     "ResearchSet",

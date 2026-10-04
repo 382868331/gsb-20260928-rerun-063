@@ -116,3 +116,42 @@ python -m local_search.cli --index ./data/index research-decide study d9 exclude
 python -m local_search.cli --index ./data/index research-continue study --budget 1000
 python -m local_search.cli --index ./data/index research-revise study '{"q1":"~fresh","q2":"york"}'
 ```
+
+## 多视角审阅与合并
+
+同一个冻结研究集可以挂多个独立审阅视角（perspective）。每个视角有自己的已读位置和决定：一个审阅者翻页或下判断，不会改变另一个视角的未读队列，也不会覆盖其对同一条证据的相反决定。不指定视角时，所有既有 API 默认作用于 `main` 视角，行为与单审阅者完全一致。
+
+```python
+research = engine.open_research_set("study")
+alice = research.perspective("alice")
+bob = research.perspective("bob")
+alice.read_page(10)                     # 只推进 alice 的已读位置
+bob.read_page(20)                       # bob 可以按不同节奏阅读
+alice.decide("d1", "included", "alice：直接相关")
+bob.decide("d1", "excluded", "bob：与研究问题无关")   # 相反决定并存
+research.save()
+```
+
+`merge_perspectives()` 把各视角的决定合并成分类报告，绝不改写任何原始判断：
+
+- `consensus`：所有参与视角都审过且结论一致；
+- `conflict`：视角之间存在真实分歧，报告逐条保留每个视角的决定与理由；
+- `unreviewed`：没有任何视角下过决定；
+- `partial`：部分视角已决定、其余仍未审；
+- `resolved`：分歧已被显式解决。
+
+分歧不靠最后一次写入覆盖：某视角再次写入只改自己的决定。要解决分歧必须调用 `resolve(doc_id, action, reason)`，它生成一条新的解决决定，通过 `references` 引用每个视角的原始判断，原始判断本身保留为证据。
+
+```python
+report = research.merge_perspectives()
+research.resolve("d1", "excluded", "负责人复核：超出范围")
+```
+
+索引更新后，`revise_research_set()`（查询不变时即派生新研究）逐视角继承：内容未变、证据签名仍相符的记录继承原决定（含已读位置，去重且不保留已删除文档）；内容变更的记录进入 `dropped_decisions`（`evidence_basis_changed`），已删除记录标记 `document_absent`，都要求重新审阅。解决决定只有在它引用的全部原判断都被继承时才随之继承。派生后的新研究集可以继续挂视角、再合并。
+
+```bash
+python -m local_search.cli --index ./data/index research-page study --page-size 20 --perspective alice
+python -m local_search.cli --index ./data/index research-decide study d1 excluded "无关" --perspective bob
+python -m local_search.cli --index ./data/index research-merge study
+python -m local_search.cli --index ./data/index research-resolve study d1 excluded "负责人复核"
+```
