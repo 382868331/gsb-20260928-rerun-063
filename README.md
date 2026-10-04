@@ -104,7 +104,28 @@ research.save()                     # 持久化；重开后顺序、已读位置
 
 **预算与未穷尽**：`budget` 未覆盖全部候选时，`exhausted` 为 `False`，未评分的命中进入 `pending_unscored`，页载荷的 `complete` 也是 `False`。暂时没出现的文档不能判断为不满足；调用 `continue_scan(更大预算或 None)` 在同一固定视角上继续评分，已确认页不变，之后的文档按同一顺序规则接续——逐页读取与一次性完整读取的顺序完全一致，同分文档按文档 ID 稳定打破平局。
 
-**修订对比**：用修订后的查询重新生成研究集时，`revise_research_set()` 返回每篇文档 `entered`/`left`/`rank_moved`/`stable` 及原因，区分 `document_changed`（文档新增、删除或正文变化）、`query_meaning_changed`（查询文本或同义词版本变化）和 `relative_order_from_other_candidates`（只是被其他候选的进出带动了相对名次）。旧研究集的人工排除/例外只在依据仍相符时继承：系统比较当时记录的逐查询证据签名（具体命中词、字段、位置），文档删除或证据变化则放入 `dropped_decisions` 要求重新审阅，绝不会只按文档 ID/名称复制决定。
+
+## 多审阅者视角与合并
+
+同一冻结研究集支持多个独立审阅视角。每个审阅者有自己的已读位置和判断，互不影响：一个人的翻页或决定不会改变另一个人的未读状态。所有逐页/决定接口都接受 `reviewer` 参数（默认 `"main"`）。
+
+```python
+research.read_page(20, reviewer="alice")      # 只推进 alice 的已读位置
+research.read_page(10, reviewer="bob")        # bob 可以按自己的节奏和顺序读
+research.decide("d3", "included", "alice: 相关", reviewer="alice")
+research.decide("d3", "excluded", "bob: 无关", reviewer="bob")   # 允许相反决定
+
+merged = research.merge_review()
+# 每篇文档区分为 consensus_included / consensus_excluded / unreviewed / conflict / resolved
+# 冲突条目完整保留各方原始判断，绝不会被最后一次写入覆盖
+
+research.resolve_conflict("d3", "included", "组长终裁：纳入")
+# 解决分歧会形成一条新的 resolution 决定，resolves 字段引用原冲突判断
+```
+
+索引更新后可从原冻结研究派生新研究：`derive_research_set(name, new_name)` 用相同查询对当前索引重建，仍存在的记录按证据签名继承各审阅者的判断与已读位置；内容变更的记录放入 `dropped_decisions`（原因 `evidence_basis_changed`），已删除记录标记 `document_absent`，都必须重新审阅。派生后的研究集可再次合并，冲突证据与解决记录一并继承。
+
+命令行对应：`research-page`/`research-status`/`research-decide` 增加 `--reviewer`；新增 `research-merge`、`research-resolve`、`research-derive`。
 
 命令行：
 

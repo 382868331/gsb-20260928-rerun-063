@@ -6,6 +6,14 @@ positional evidence; scores from different queries are never summed into a
 single relevance number.  The set pins the exact query texts, synonym rule
 version and document bodies used at confirmation time, so confirmed pages
 keep a stable order even when the live corpus changes later.
+
+Several independent reviewer perspectives can read and judge the same
+frozen set.  Each reviewer keeps its own read positions and decisions;
+one reviewer's paging or deciding never touches another reviewer's
+unreviewed state.  Merging the perspectives distinguishes consensus,
+unreviewed documents and genuine disagreements.  A disagreement is never
+silently overwritten by the last write: resolving it records a new
+resolution decision that cites the original conflicting judgements.
 """
 
 from dataclasses import dataclass, field
@@ -26,6 +34,14 @@ INCLUDED = "included"
 EXCLUDED = "excluded"
 PENDING_REVIEW = "pending"
 
+DEFAULT_REVIEWER = "main"
+
+CONSENSUS_INCLUDED = "consensus_included"
+CONSENSUS_EXCLUDED = "consensus_excluded"
+MERGE_UNREVIEWED = "unreviewed"
+MERGE_CONFLICT = "conflict"
+MERGE_RESOLVED = "resolved"
+
 
 @dataclass(frozen=True)
 class QuerySpec:
@@ -40,6 +56,15 @@ class Decision:
     basis: Dict[str, dict] = field(default_factory=dict)
     rules_version: Optional[int] = None
     inherited: bool = False
+    resolves: Optional[List[dict]] = None  # conflicting decisions this resolution cites
+
+
+@dataclass
+class ReviewerState:
+    """One reviewer's private reading position and judgements."""
+
+    read_ids: List[str] = field(default_factory=list)
+    decisions: Dict[str, Decision] = field(default_factory=dict)
 
 
 @dataclass
@@ -120,12 +145,32 @@ class ResearchSet:
         self.ranker_name = _ranker_name(ranker)
         self.budget = budget
         self.path = path
-        self.decisions: Dict[str, Decision] = {}
-        self.read_ids: List[str] = []
+        self.reviewers: Dict[str, ReviewerState] = {DEFAULT_REVIEWER: ReviewerState()}
+        self.resolutions: Dict[str, Decision] = {}
         self.evidence: Dict[str, Dict[str, CandidateEvidence]] = {}
         self.outcomes: Dict[str, RankingOutcome] = {}
         self.exhausted = False
         self._recompute()
+
+    # ------------------------------------------------------- reviewer state
+
+    @property
+    def read_ids(self) -> List[str]:
+        """Read positions of the default reviewer (backwards compatible)."""
+        return self.reviewers[DEFAULT_REVIEWER].read_ids
+
+    @property
+    def decisions(self) -> Dict[str, Decision]:
+        """Decisions of the default reviewer (backwards compatible)."""
+        return self.reviewers[DEFAULT_REVIEWER].decisions
+
+    def reviewer_state(self, reviewer: str = DEFAULT_REVIEWER) -> ReviewerState:
+        if not reviewer:
+            raise ValueError("Reviewer name must be a non-empty string")
+        return self.reviewers.setdefault(reviewer, ReviewerState())
+
+    def reviewer_names(self) -> List[str]:
+        return sorted(self.reviewers)
 
     def _bound_queries(self) -> List[Tuple[QuerySpec, object]]:
         return [(spec, parse_query(spec.raw).with_rules(self.rules)) for spec in self.specs]
@@ -189,18 +234,19 @@ class ResearchSet:
         vector = tuple(rank if rank is not None else big for rank in ranks)
         return (best, -len(scored_ranks), vector, doc_id)
 
-    def _ordered_candidate_ids(self) -> Tuple[List[str], List[str]]:
+    def _ordered_candidate_ids(self, reviewer: str = DEFAULT_REVIEWER) -> Tuple[List[str], List[str]]:
         """Return (evaluated_order, pending_unscored) document ids."""
+        decisions = self.reviewer_state(reviewer).decisions
         evaluated: List[str] = []
         pending: List[str] = []
         candidate_pool = set(self.evidence) | {
             doc_id
-            for doc_id, decision in self.decisions.items()
+            for doc_id, decision in decisions.items()
             if decision.action == INCLUDED
         }
         for doc_id in sorted(candidate_pool):
             is_candidate, fully = self._membership(doc_id)
-            decision = self.decisions.get(doc_id)
+            decision = decisions.get(doc_id)
             if not is_candidate and decision is None:
                 continue
             if decision is not None and decision.action == EXCLUDED:
@@ -212,7 +258,7 @@ class ResearchSet:
         pending.sort(key=self._combined_key)
         return evaluated, pending
 
-    def reading_order(self) -> List[str]:
+    def reading_order(self, reviewer: str = DEFAULT_REVIEWER) -> List[str]:
         """Full reading list: frozen already-read prefix, then current order.
 
         Confirmed documents keep the order in which they were first read;
@@ -221,20 +267,21 @@ class ResearchSet:
         a document, and a fresh exhaustive read of the same perspective is
         exactly this order.
         """
-        evaluated, pending = self._ordered_candidate_ids()
+        state = self.reviewer_state(reviewer)
+        evaluated, pending = self._ordered_candidate_ids(reviewer)
         current = evaluated + pending
-        read = [doc_id for doc_id in self.read_ids if doc_id in current]
+        read = [doc_id for doc_id in state.read_ids if doc_id in current]
         seen = set(read)
         return read + [doc_id for doc_id in current if doc_id not in seen]
 
-    def page(self, offset: int = 0, page_size: Optional[int] = None) -> dict:
-        ordered = self.reading_order()
+    def page(self, offset: int = 0, page_size: Optional[int] = None, reviewer: str = DEFAULT_REVIEWER) -> dict:
+        ordered = self.reading_order(reviewer)
         end = len(ordered) if page_size is None else min(offset + page_size, len(ordered))
         ids = ordered[offset:end]
         next_offset = end if end < len(ordered) else None
-        _, pending = self._ordered_candidate_ids()
+        _, pending = self._ordered_candidate_ids(reviewer)
         return {
-            "results": [self.document_payload(doc_id) for doc_id in ids],
+            "results": [self.document_payload(doc_id, reviewer) for doc_id in ids],
             "offset": offset,
             "next_offset": next_offset,
             "exhausted": self.exhausted,
@@ -243,39 +290,44 @@ class ResearchSet:
             "pending_unscored": len(pending),
         }
 
-    def read_page(self, page_size: Optional[int] = None) -> dict:
-        """Read the next unreviewed slice and mark it reviewed."""
-        ordered = self.reading_order()
-        offset = len([doc_id for doc_id in self.read_ids if doc_id in ordered])
-        payload = self.page(offset, page_size)
+    def read_page(self, page_size: Optional[int] = None, reviewer: str = DEFAULT_REVIEWER) -> dict:
+        """Read the next unreviewed slice and mark it reviewed for this reviewer."""
+        state = self.reviewer_state(reviewer)
+        ordered = self.reading_order(reviewer)
+        offset = len([doc_id for doc_id in state.read_ids if doc_id in ordered])
+        payload = self.page(offset, page_size, reviewer)
         for result in payload["results"]:
-            if result["id"] not in self.read_ids:
-                self.read_ids.append(result["id"])
-        payload["reviewed_count"] = len(self.read_ids)
+            if result["id"] not in state.read_ids:
+                state.read_ids.append(result["id"])
+        payload["reviewed_count"] = len(state.read_ids)
+        payload["reviewer"] = reviewer
         return payload
 
-    def unreviewed(self) -> List[str]:
-        ordered = self.reading_order()
-        return [doc_id for doc_id in ordered if doc_id not in self.read_ids]
+    def unreviewed(self, reviewer: str = DEFAULT_REVIEWER) -> List[str]:
+        state = self.reviewer_state(reviewer)
+        ordered = self.reading_order(reviewer)
+        return [doc_id for doc_id in ordered if doc_id not in state.read_ids]
 
-    def review_status(self) -> dict:
-        evaluated, pending = self._ordered_candidate_ids()
+    def review_status(self, reviewer: str = DEFAULT_REVIEWER) -> dict:
+        state = self.reviewer_state(reviewer)
+        evaluated, pending = self._ordered_candidate_ids(reviewer)
         current = set(evaluated + pending)
         return {
+            "reviewer": reviewer,
             "exhausted": self.exhausted,
             "candidate_count": len(current),
-            "reviewed": [doc_id for doc_id in self.read_ids if doc_id in current],
-            "unreviewed": self.unreviewed(),
+            "reviewed": [doc_id for doc_id in state.read_ids if doc_id in current],
+            "unreviewed": self.unreviewed(reviewer),
             "excluded": sorted(
-                doc_id for doc_id, decision in self.decisions.items() if decision.action == EXCLUDED
+                doc_id for doc_id, decision in state.decisions.items() if decision.action == EXCLUDED
             ),
             "manual_included": sorted(
-                doc_id for doc_id, decision in self.decisions.items() if decision.action == INCLUDED
+                doc_id for doc_id, decision in state.decisions.items() if decision.action == INCLUDED
             ),
             "pending_unscored": sorted(pending),
         }
 
-    def decide(self, doc_id: str, action: str, reason: str) -> Decision:
+    def decide(self, doc_id: str, action: str, reason: str, reviewer: str = DEFAULT_REVIEWER) -> Decision:
         if action not in (INCLUDED, EXCLUDED):
             raise ValueError("decision action must be 'included' or 'excluded'")
         if not reason or not reason.strip():
@@ -290,10 +342,11 @@ class ResearchSet:
         if not is_candidate and action != INCLUDED:
             raise ValueError("Only an inclusion exception can be recorded for a non-matching document")
         decision = Decision(action, reason.strip(), basis, self.rules.version)
-        self.decisions[doc_id] = decision
+        self.reviewer_state(reviewer).decisions[doc_id] = decision
         return decision
 
-    def document_payload(self, doc_id: str) -> dict:
+    def document_payload(self, doc_id: str, reviewer: str = DEFAULT_REVIEWER) -> dict:
+        state = self.reviewer_state(reviewer)
         stored = self.documents[doc_id]
         per_query: Dict[str, dict] = {}
         for spec in self.specs:
@@ -313,7 +366,7 @@ class ResearchSet:
                     SearchView.excluded_rawhs(parse_query(spec.raw).with_rules(self.rules)),
                 ),
             }
-        decision = self.decisions.get(doc_id)
+        decision = state.decisions.get(doc_id)
         return {
             "id": doc_id,
             "fields": dict(stored.fields),
@@ -321,7 +374,7 @@ class ResearchSet:
             "per_query": per_query,
             "review": decision.action if decision is not None else PENDING_REVIEW,
             "review_reason": decision.reason if decision is not None else None,
-            "reviewed": doc_id in self.read_ids,
+            "reviewed": doc_id in state.read_ids,
         }
 
     def continue_scan(self, budget: Optional[int] = None) -> None:
@@ -330,6 +383,116 @@ class ResearchSet:
             raise ValueError("Continuation can only raise the scan budget")
         self.budget = budget
         self._recompute()
+
+    # ------------------------------------------------------- merging
+
+    def merge_review(self, reviewers: Optional[Sequence[str]] = None) -> dict:
+        """Merge every reviewer's judgements without overwriting any of them.
+
+        Each document is classified as a consensus (all deciding reviewers
+        agree), still unreviewed (no reviewer decided), a genuine conflict
+        (reviewers disagree), or resolved (a resolution decision exists).
+        The original per-reviewer decisions are always reported alongside,
+        so conflicting evidence is never lost.
+        """
+        names = list(reviewers) if reviewers is not None else self.reviewer_names()
+        for name in names:
+            if name not in self.reviewers:
+                raise KeyError(f"Unknown reviewer: {name}")
+        doc_ids = set(self.evidence) | set(self.resolutions)
+        for name in names:
+            doc_ids |= set(self.reviewers[name].decisions)
+
+        documents: Dict[str, dict] = {}
+        summary = {
+            CONSENSUS_INCLUDED: 0,
+            CONSENSUS_EXCLUDED: 0,
+            MERGE_UNREVIEWED: 0,
+            MERGE_CONFLICT: 0,
+            MERGE_RESOLVED: 0,
+        }
+        for doc_id in sorted(doc_ids):
+            per_reviewer = {
+                name: {
+                    "action": self.reviewers[name].decisions[doc_id].action,
+                    "reason": self.reviewers[name].decisions[doc_id].reason,
+                }
+                for name in names
+                if doc_id in self.reviewers[name].decisions
+            }
+            resolution = self.resolutions.get(doc_id)
+            if resolution is not None:
+                status = MERGE_RESOLVED
+            elif not per_reviewer:
+                status = MERGE_UNREVIEWED
+            elif len({entry["action"] for entry in per_reviewer.values()}) == 1:
+                action = next(iter(per_reviewer.values()))["action"]
+                status = CONSENSUS_INCLUDED if action == INCLUDED else CONSENSUS_EXCLUDED
+            else:
+                status = MERGE_CONFLICT
+            summary[status] += 1
+            documents[doc_id] = {
+                "status": status,
+                "decisions": per_reviewer,
+                "resolution": (
+                    None
+                    if resolution is None
+                    else {
+                        "action": resolution.action,
+                        "reason": resolution.reason,
+                        "resolves": resolution.resolves or [],
+                    }
+                ),
+            }
+        return {
+            "reviewers": names,
+            "documents": documents,
+            "summary": summary,
+            "conflicts": sorted(
+                doc_id for doc_id, entry in documents.items() if entry["status"] == MERGE_CONFLICT
+            ),
+            "unreviewed": sorted(
+                doc_id for doc_id, entry in documents.items() if entry["status"] == MERGE_UNREVIEWED
+            ),
+        }
+
+    def resolve_conflict(
+        self,
+        doc_id: str,
+        action: str,
+        reason: str,
+        reviewer: str = DEFAULT_REVIEWER,
+    ) -> Decision:
+        """Resolve a genuine conflict with a new decision citing the originals.
+
+        The conflicting per-reviewer decisions stay untouched; the resolution
+        is a separate decision that references them, so the disagreement
+        remains auditable instead of being overwritten.
+        """
+        if action not in (INCLUDED, EXCLUDED):
+            raise ValueError("resolution action must be 'included' or 'excluded'")
+        if not reason or not reason.strip():
+            raise ValueError("A conflict resolution needs an explicit reason")
+        conflicting = [
+            {"reviewer": name, "action": state.decisions[doc_id].action, "reason": state.decisions[doc_id].reason}
+            for name, state in sorted(self.reviewers.items())
+            if doc_id in state.decisions
+        ]
+        if len({entry["action"] for entry in conflicting}) < 2:
+            raise ValueError(f"Document {doc_id} has no genuine conflict to resolve")
+        basis = {
+            label: evidence.signature
+            for label, evidence in self.evidence.get(doc_id, {}).items()
+        }
+        resolution = Decision(
+            action,
+            reason.strip(),
+            basis,
+            self.rules.version,
+            resolves=conflicting,
+        )
+        self.resolutions[doc_id] = resolution
+        return resolution
 
     def to_payload(self) -> dict:
         return {
@@ -340,18 +503,22 @@ class ResearchSet:
             "rules": self.rules.to_payload(),
             "queries": [{"label": spec.label, "raw": spec.raw} for spec in self.specs],
             "documents": {doc_id: dict(doc.fields) for doc_id, doc in self.documents.items()},
-            "read_ids": list(self.read_ids),
-            "decisions": {
-                doc_id: {
-                    "action": decision.action,
-                    "reason": decision.reason,
-                    "basis": decision.basis,
-                    "rules_version": decision.rules_version,
-                    "inherited": decision.inherited,
+            "reviewers": {
+                name: {
+                    "read_ids": list(state.read_ids),
+                    "decisions": {
+                        doc_id: _decision_payload(decision)
+                        for doc_id, decision in state.decisions.items()
+                    },
                 }
-                for doc_id, decision in self.decisions.items()
+                for name, state in sorted(self.reviewers.items())
+            },
+            "resolutions": {
+                doc_id: _decision_payload(decision)
+                for doc_id, decision in self.resolutions.items()
             },
         }
+
 
     def save(self) -> None:
         if self.path is None:
@@ -377,16 +544,56 @@ class ResearchSet:
             budget=payload.get("budget"),
             path=path,
         )
-        research.read_ids = list(payload.get("read_ids", []))
-        for doc_id, entry in payload.get("decisions", {}).items():
-            research.decisions[doc_id] = Decision(
-                action=entry["action"],
-                reason=entry["reason"],
-                basis=entry.get("basis", {}),
-                rules_version=entry.get("rules_version"),
-                inherited=bool(entry.get("inherited", False)),
-            )
+        if "reviewers" in payload:
+            research.reviewers = {}
+            for name, state_payload in payload["reviewers"].items():
+                research.reviewers[name] = ReviewerState(
+                    read_ids=list(state_payload.get("read_ids", [])),
+                    decisions={
+                        doc_id: _decision_from_payload(entry)
+                        for doc_id, entry in state_payload.get("decisions", {}).items()
+                    },
+                )
+            if DEFAULT_REVIEWER not in research.reviewers:
+                research.reviewers[DEFAULT_REVIEWER] = ReviewerState()
+        else:
+            # Legacy single-reviewer payload.
+            research.reviewers = {
+                DEFAULT_REVIEWER: ReviewerState(
+                    read_ids=list(payload.get("read_ids", [])),
+                    decisions={
+                        doc_id: _decision_from_payload(entry)
+                        for doc_id, entry in payload.get("decisions", {}).items()
+                    },
+                )
+            }
+        research.resolutions = {
+            doc_id: _decision_from_payload(entry)
+            for doc_id, entry in payload.get("resolutions", {}).items()
+        }
         return research
+
+
+def _decision_payload(decision: Decision) -> dict:
+    return {
+        "action": decision.action,
+        "reason": decision.reason,
+        "basis": decision.basis,
+        "rules_version": decision.rules_version,
+        "inherited": decision.inherited,
+        "resolves": decision.resolves,
+    }
+
+
+def _decision_from_payload(entry: dict) -> Decision:
+    return Decision(
+        action=entry["action"],
+        reason=entry["reason"],
+        basis=entry.get("basis", {}),
+        rules_version=entry.get("rules_version"),
+        inherited=bool(entry.get("inherited", False)),
+        resolves=entry.get("resolves"),
+    )
 # --------------------------------------------------------------------- revision
 
 DOCUMENT_ENTERED = "entered"
@@ -450,7 +657,7 @@ def compare_research_sets(old: ResearchSet, new: ResearchSet) -> dict:
             "reasons": [] if delta == 0 else _move_reasons(old, new, doc_id, query_meaning_changed),
         })
 
-    inherited, dropped = _inherit_decisions(old, new)
+    inherited, dropped = _inherit_reviewers(old, new)
     return {
         "query_meaning_changed": query_meaning_changed,
         "old_exhausted": old.exhausted,
@@ -505,8 +712,7 @@ def _move_reasons(old: ResearchSet, new: ResearchSet, doc_id: str, query_changed
     return reasons
 
 
-def _decision_basis_still_matches(old: ResearchSet, new: ResearchSet, doc_id: str) -> bool:
-    decision = old.decisions[doc_id]
+def _decision_basis_still_matches(old: ResearchSet, new: ResearchSet, decision: Decision, doc_id: str) -> bool:
     if not decision.basis:
         # Exception for a document that never matched: identical body required.
         return _doc_body(old, doc_id) == _doc_body(new, doc_id)
@@ -518,29 +724,74 @@ def _decision_basis_still_matches(old: ResearchSet, new: ResearchSet, doc_id: st
     return True
 
 
-def _inherit_decisions(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], List[dict]]:
+def _inherit_one_decision(old: ResearchSet, new: ResearchSet, decision: Decision, doc_id: str) -> Decision:
+    new_evidence = new.evidence.get(doc_id, {})
+    basis = {
+        label: new_evidence[label].signature
+        for label in decision.basis
+        if label in new_evidence
+    }
+    return Decision(
+        action=decision.action,
+        reason=decision.reason,
+        basis=basis or decision.basis,
+        rules_version=new.rules.version,
+        inherited=True,
+        resolves=decision.resolves,
+    )
+
+
+def _inherit_reviewers(old: ResearchSet, new: ResearchSet) -> Tuple[List[dict], List[dict]]:
+    """Carry each reviewer's decisions, read positions and resolutions over.
+
+    Every reviewer keeps their own perspective in the derived set.  A
+    decision is inherited only while its recorded evidence basis still
+    matches; documents whose content changed or that were deleted are
+    reported explicitly instead of silently losing or copying judgements.
+    Read positions survive only for documents still present, and never
+    duplicate.
+    """
     inherited: List[dict] = []
     dropped: List[dict] = []
-    for doc_id, decision in old.decisions.items():
+    new_current = set(new.reading_order())
+    for reviewer, state in old.reviewers.items():
+        new_state = new.reviewer_state(reviewer)
+        seen: set = set()
+        for doc_id in state.read_ids:
+            if doc_id in new_current and doc_id not in seen:
+                new_state.read_ids.append(doc_id)
+                seen.add(doc_id)
+        for doc_id, decision in state.decisions.items():
+            if doc_id not in new.documents:
+                dropped.append({
+                    "id": doc_id,
+                    "reviewer": reviewer,
+                    "action": decision.action,
+                    "reason": "document_absent",
+                })
+                continue
+            if _decision_basis_still_matches(old, new, decision, doc_id):
+                new_state.decisions[doc_id] = _inherit_one_decision(old, new, decision, doc_id)
+                inherited.append({"id": doc_id, "reviewer": reviewer, "action": decision.action})
+            else:
+                dropped.append({
+                    "id": doc_id,
+                    "reviewer": reviewer,
+                    "action": decision.action,
+                    "reason": "evidence_basis_changed",
+                })
+    for doc_id, resolution in old.resolutions.items():
         if doc_id not in new.documents:
-            dropped.append({"id": doc_id, "action": decision.action, "reason": "document_absent"})
+            dropped.append({"id": doc_id, "reviewer": None, "action": resolution.action, "reason": "document_absent"})
             continue
-        if _decision_basis_still_matches(old, new, doc_id):
-            new_evidence = new.evidence.get(doc_id, {})
-            basis = {
-                label: new_evidence[label].signature
-                for label in decision.basis
-                if label in new_evidence
-            }
-            inherited_decision = Decision(
-                action=decision.action,
-                reason=decision.reason,
-                basis=basis or decision.basis,
-                rules_version=new.rules.version,
-                inherited=True,
-            )
-            new.decisions[doc_id] = inherited_decision
-            inherited.append({"id": doc_id, "action": decision.action})
+        if _decision_basis_still_matches(old, new, resolution, doc_id):
+            new.resolutions[doc_id] = _inherit_one_decision(old, new, resolution, doc_id)
+            inherited.append({"id": doc_id, "reviewer": None, "action": resolution.action})
         else:
-            dropped.append({"id": doc_id, "action": decision.action, "reason": "evidence_basis_changed"})
+            dropped.append({
+                "id": doc_id,
+                "reviewer": None,
+                "action": resolution.action,
+                "reason": "evidence_basis_changed",
+            })
     return inherited, dropped

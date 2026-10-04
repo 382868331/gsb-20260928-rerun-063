@@ -269,6 +269,22 @@ class SearchEngine:
         new.save()
         return report
 
+    def derive_research_set(
+        self,
+        name: str,
+        new_name: str,
+        *,
+        budget: Optional[int] = None,
+    ) -> dict:
+        """Derive a new research set from a frozen one against the live index.
+
+        The queries stay the same; documents that still exist keep their
+        reviewers' evidence-based decisions and read positions, while
+        changed or deleted records are reported explicitly in the returned
+        comparison (dropped_decisions) instead of being silently lost.
+        """
+        return self.revise_research_set(name, None, budget=budget, new_name=new_name)
+
     def _run_query(self, view: SearchView, query: Query, limit: Optional[int]) -> List[Dict[str, object]]:
         query = query.with_rules(view.rules)
         matches = view.run(query)
