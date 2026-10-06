@@ -16,6 +16,7 @@ never settled by overwriting, only by an explicit resolution decision that
 references the original judgements.
 """
 
+import json
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -48,6 +49,10 @@ DECISION_ACTIVE = "active"
 DECISION_WITHDRAWN = "withdrawn"
 RESOLUTION_PENDING_RECHECK = "pending_recheck"
 
+PLAN_DRAFT = "draft"
+PLAN_APPLIED = "applied"
+PLAN_CANCELLED = "cancelled"
+
 
 @dataclass(frozen=True)
 class QuerySpec:
@@ -75,6 +80,31 @@ class WithdrawalBatch:
     perspective: str
     reason: str
     decisions: Dict[str, Decision] = field(default_factory=dict)
+
+
+@dataclass
+class WithdrawalPlan:
+    """A reviewable, persisted proposal to withdraw dependent opinions.
+
+    The plan records the exact opinions targeted at planning time (with a
+    fingerprint of each), the resolutions that would flip to pending
+    recheck, the ones that keep independent support, and any keep-target
+    conflicts.  Nothing changes until the plan is applied; a cancelled or
+    applied plan is never reapplied, and opinions that changed since
+    planning are skipped instead of being silently mixed in.
+    """
+
+    plan_id: str
+    perspective: str
+    reason: str
+    requested: List[str] = field(default_factory=list)
+    keep: List[str] = field(default_factory=list)
+    references: List[str] = field(default_factory=list)
+    status: str = PLAN_DRAFT
+    entries: Dict[str, dict] = field(default_factory=dict)
+    report: dict = field(default_factory=dict)
+    batch_id: Optional[str] = None
+    applied: Optional[dict] = None
 
 
 @dataclass
@@ -186,6 +216,52 @@ def _withdrawal_from_payload(entry: dict) -> WithdrawalBatch:
     )
 
 
+def _decision_fingerprint(decision: Decision) -> str:
+    """Stable identity of one opinion, used to detect post-plan changes."""
+    return json.dumps(
+        {
+            "action": decision.action,
+            "reason": decision.reason,
+            "basis": decision.basis,
+            "rules_version": decision.rules_version,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+def _plan_payload(plan: WithdrawalPlan) -> dict:
+    return {
+        "plan_id": plan.plan_id,
+        "perspective": plan.perspective,
+        "reason": plan.reason,
+        "requested": list(plan.requested),
+        "keep": list(plan.keep),
+        "references": list(plan.references),
+        "status": plan.status,
+        "entries": dict(plan.entries),
+        "report": plan.report,
+        "batch_id": plan.batch_id,
+        "applied": plan.applied,
+    }
+
+
+def _plan_from_payload(entry: dict) -> WithdrawalPlan:
+    return WithdrawalPlan(
+        plan_id=entry["plan_id"],
+        perspective=entry["perspective"],
+        reason=entry["reason"],
+        requested=list(entry.get("requested", [])),
+        keep=list(entry.get("keep", [])),
+        references=list(entry.get("references", [])),
+        status=entry.get("status", PLAN_DRAFT),
+        entries=dict(entry.get("entries", {})),
+        report=dict(entry.get("report", {})),
+        batch_id=entry.get("batch_id"),
+        applied=entry.get("applied"),
+    )
+
+
 class ResearchSet:
     def __init__(
         self,
@@ -220,6 +296,7 @@ class ResearchSet:
         self.resolutions: Dict[str, Decision] = {}
         self.resolution_history: Dict[str, List[Decision]] = {}
         self.withdrawals: Dict[str, WithdrawalBatch] = {}
+        self.withdrawal_plans: Dict[str, WithdrawalPlan] = {}
         self.evidence: Dict[str, Dict[str, CandidateEvidence]] = {}
         self.outcomes: Dict[str, RankingOutcome] = {}
         self.exhausted = False
@@ -531,6 +608,354 @@ class ResearchSet:
             )
         return batch
 
+    # ----------------------------------------------------- withdrawal plans
+    def _opinion_is_active(self, perspective: str, doc_id: str) -> bool:
+        view = self.perspectives.get(perspective)
+        if view is None:
+            return False
+        decision = view.decisions.get(doc_id)
+        return decision is not None and decision.status == DECISION_ACTIVE
+
+    @staticmethod
+    def _cited_opinions(doc_id: str, resolution: Decision) -> List[Tuple[str, str]]:
+        """(perspective, opinion doc) pairs a resolution depends on.
+
+        References may carry an explicit doc_id for cross-document
+        citations; without one the reference points at the opinion on the
+        resolved document itself.
+        """
+        return [
+            (ref.get("perspective"), ref.get("doc_id", doc_id))
+            for ref in resolution.references
+        ]
+
+    def _dependent_resolutions(
+        self, perspective: str, scope: set
+    ) -> Tuple[List[dict], List[dict]]:
+        """Split affected resolutions into recheck vs independently supported.
+
+        A resolution flips to pending recheck only when every opinion it
+        cites is either withdrawn by this scope or already inactive; while
+        another researcher's still-active cited opinion remains, the
+        resolution keeps independent support and stays unchanged.
+        """
+        recheck: List[dict] = []
+        supported: List[dict] = []
+        for doc_id, resolution in sorted(self.resolutions.items()):
+            if resolution.status != DECISION_ACTIVE:
+                continue
+            cited = self._cited_opinions(doc_id, resolution)
+            withdrawn = [
+                (name, opinion_doc)
+                for name, opinion_doc in cited
+                if name == perspective and opinion_doc in scope
+            ]
+            if not withdrawn:
+                continue
+            remaining = [
+                (name, opinion_doc)
+                for name, opinion_doc in cited
+                if not (name == perspective and opinion_doc in scope)
+                and self._opinion_is_active(name, opinion_doc)
+            ]
+            entry = {
+                "id": doc_id,
+                "action": resolution.action,
+                "reason": resolution.reason,
+                "references": list(resolution.references),
+                "withdrawn_opinions": [
+                    {"perspective": name, "doc_id": opinion_doc}
+                    for name, opinion_doc in withdrawn
+                ],
+            }
+            if remaining:
+                entry["supported_by"] = [
+                    {"perspective": name, "doc_id": opinion_doc}
+                    for name, opinion_doc in remaining
+                ]
+                supported.append(entry)
+            else:
+                recheck.append(entry)
+        return recheck, supported
+
+    def _compute_plan_report(
+        self, perspective: str, requested: List[str], keep: List[str]
+    ) -> dict:
+        """Derive the minimal feasible scope and the full preview.
+
+        Opinions whose withdrawal would flip a must-keep resolution to
+        recheck are blocked: they leave the feasible scope and are reported
+        as conflicts with their evidence, never silently overridden.
+        """
+        feasible = set(requested)
+        blocked: Dict[str, dict] = {}
+        conflicts: List[dict] = []
+        for doc_id in keep:
+            resolution = self.resolutions.get(doc_id)
+            if resolution is None or resolution.status != DECISION_ACTIVE:
+                conflicts.append({
+                    "id": doc_id,
+                    "conflict": "keep_target_not_confirmed",
+                    "resolution": (
+                        {
+                            "action": resolution.action,
+                            "reason": resolution.reason,
+                            "status": resolution.status,
+                            "references": list(resolution.references),
+                        }
+                        if resolution is not None
+                        else None
+                    ),
+                })
+        while True:
+            recheck, supported = self._dependent_resolutions(perspective, feasible)
+            recheck_ids = {entry["id"] for entry in recheck}
+            newly_blocked = False
+            for doc_id in keep:
+                if doc_id not in recheck_ids:
+                    continue
+                resolution = self.resolutions[doc_id]
+                cited = self._cited_opinions(doc_id, resolution)
+                blockers = [
+                    opinion_doc
+                    for name, opinion_doc in cited
+                    if name == perspective and opinion_doc in feasible
+                ]
+                if not blockers:
+                    conflicts.append({
+                        "id": doc_id,
+                        "conflict": "keep_target_loses_support",
+                        "resolution": {
+                            "action": resolution.action,
+                            "reason": resolution.reason,
+                            "status": resolution.status,
+                            "references": list(resolution.references),
+                        },
+                    })
+                    continue
+                for opinion_doc in blockers:
+                    feasible.discard(opinion_doc)
+                    blocked[opinion_doc] = {
+                        "id": opinion_doc,
+                        "conflict": "withdrawal_would_recheck_kept_resolution",
+                        "kept_resolution": doc_id,
+                        "resolution": {
+                            "action": resolution.action,
+                            "reason": resolution.reason,
+                            "references": list(resolution.references),
+                        },
+                    }
+                    newly_blocked = True
+            if not newly_blocked:
+                break
+        recheck, supported = self._dependent_resolutions(perspective, feasible)
+        view = self._persp(perspective)
+        unchanged = sorted(
+            doc_id
+            for doc_id, decision in view.decisions.items()
+            if decision.status == DECISION_ACTIVE and doc_id not in feasible
+        )
+        return {
+            "withdraw": sorted(feasible),
+            "blocked": [blocked[doc_id] for doc_id in sorted(blocked)],
+            "recheck_resolutions": recheck,
+            "supported_resolutions": supported,
+            "unchanged_opinions": unchanged,
+            "conflicts": conflicts,
+        }
+
+    def plan_withdrawal(
+        self,
+        doc_ids: Sequence[str],
+        reason: str,
+        perspective: Optional[str] = None,
+        *,
+        keep: Sequence[str] = (),
+        references: Sequence[str] = (),
+        plan_id: Optional[str] = None,
+    ) -> WithdrawalPlan:
+        """Draft a dependent withdrawal plan without changing anything.
+
+        doc_ids are the original opinions to withdraw; references are
+        opinions the plan only cites (withdrawing a citation never deletes
+        the original opinion); keep lists documents whose confirmed
+        resolutions must stay confirmed.  The returned plan previews the
+        minimal feasible scope, the resolutions that would turn pending
+        recheck, the ones that keep independent support and any keep
+        conflicts.
+        """
+        view = self._persp(perspective)
+        if not doc_ids:
+            raise ValueError("A withdrawal plan needs at least one document")
+        if not reason or not reason.strip():
+            raise ValueError("A withdrawal plan needs an explicit reason")
+        requested = list(dict.fromkeys(doc_ids))
+        keep_ids = list(dict.fromkeys(keep))
+        reference_ids = [doc_id for doc_id in dict.fromkeys(references) if doc_id not in requested]
+        missing = [
+            doc_id
+            for doc_id in requested
+            if not self._opinion_is_active(view.name, doc_id)
+        ]
+        if missing:
+            raise KeyError(
+                "No active opinion from this perspective for: " + ", ".join(missing)
+            )
+        unknown_keep = [doc_id for doc_id in keep_ids if doc_id not in self.documents]
+        if unknown_keep:
+            raise KeyError("Unknown keep documents: " + ", ".join(unknown_keep))
+
+        if plan_id is None:
+            sequence = len(self.withdrawal_plans) + 1
+            plan_id = f"plan-{sequence}"
+            while plan_id in self.withdrawal_plans:
+                sequence += 1
+                plan_id = f"plan-{sequence}"
+        if not plan_id or plan_id in self.withdrawal_plans:
+            raise ValueError("Withdrawal plan id must be unique and non-empty")
+
+        entries = {
+            doc_id: {
+                "action": view.decisions[doc_id].action,
+                "reason": view.decisions[doc_id].reason,
+                "fingerprint": _decision_fingerprint(view.decisions[doc_id]),
+            }
+            for doc_id in requested
+        }
+        report = self._compute_plan_report(view.name, requested, keep_ids)
+        plan = WithdrawalPlan(
+            plan_id=plan_id,
+            perspective=view.name,
+            reason=reason.strip(),
+            requested=requested,
+            keep=keep_ids,
+            references=reference_ids,
+            entries=entries,
+            report=report,
+        )
+        self.withdrawal_plans[plan_id] = plan
+        return plan
+
+    def withdrawal_plan_payload(self, plan_id: str) -> dict:
+        if plan_id not in self.withdrawal_plans:
+            raise KeyError("Unknown withdrawal plan: " + str(plan_id))
+        return _plan_payload(self.withdrawal_plans[plan_id])
+
+    def cancel_withdrawal_plan(self, plan_id: str) -> WithdrawalPlan:
+        """Cancel a draft plan; applied plans are history and stay."""
+        if plan_id not in self.withdrawal_plans:
+            raise KeyError("Unknown withdrawal plan: " + str(plan_id))
+        plan = self.withdrawal_plans[plan_id]
+        if plan.status != PLAN_DRAFT:
+            raise ValueError("Only a draft withdrawal plan can be cancelled")
+        plan.status = PLAN_CANCELLED
+        return plan
+
+    def apply_withdrawal_plan(self, plan_id: str) -> WithdrawalPlan:
+        """Apply a draft plan's feasible scope exactly as previewed.
+
+        Re-validation happens at apply time (including after a reopen):
+        opinions already withdrawn are skipped instead of withdrawn twice,
+        and opinions whose content changed since planning are skipped so
+        newly added reviews are never mixed into an old plan.  If a
+        must-keep resolution would now lose its support, the apply aborts
+        with the conflict evidence instead of overriding the resolution.
+        """
+        if plan_id not in self.withdrawal_plans:
+            raise KeyError("Unknown withdrawal plan: " + str(plan_id))
+        plan = self.withdrawal_plans[plan_id]
+        if plan.status == PLAN_APPLIED:
+            raise ValueError("Withdrawal plan already applied")
+        if plan.status == PLAN_CANCELLED:
+            raise ValueError("Withdrawal plan was cancelled")
+        view = self._persp(plan.perspective)
+
+        valid: List[str] = []
+        skipped: Dict[str, str] = {}
+        for doc_id in plan.report.get("withdraw", []):
+            decision = view.decisions.get(doc_id)
+            if decision is None or decision.status != DECISION_ACTIVE:
+                skipped[doc_id] = "already_withdrawn"
+                continue
+            if _decision_fingerprint(decision) != plan.entries[doc_id]["fingerprint"]:
+                skipped[doc_id] = "opinion_changed_since_plan"
+                continue
+            valid.append(doc_id)
+
+        scope = set(valid)
+        recheck, supported = self._dependent_resolutions(plan.perspective, scope)
+        recheck_ids = {entry["id"] for entry in recheck}
+        violations = []
+        for doc_id in plan.keep:
+            resolution = self.resolutions.get(doc_id)
+            if resolution is None or resolution.status != DECISION_ACTIVE:
+                violations.append({
+                    "id": doc_id,
+                    "conflict": "keep_target_not_confirmed",
+                })
+            elif doc_id in recheck_ids:
+                violations.append({
+                    "id": doc_id,
+                    "conflict": "keep_target_loses_support",
+                    "resolution": {
+                        "action": resolution.action,
+                        "reason": resolution.reason,
+                        "references": list(resolution.references),
+                    },
+                })
+        if violations:
+            raise ValueError(
+                "Withdrawal plan conflicts with must-keep resolutions: "
+                + json.dumps(violations, ensure_ascii=False)
+            )
+
+        sequence = len(self.withdrawals) + 1
+        batch_id = f"withdrawal-{sequence}"
+        while batch_id in self.withdrawals:
+            sequence += 1
+            batch_id = f"withdrawal-{sequence}"
+        archived = {
+            doc_id: replace(
+                view.decisions[doc_id],
+                status=DECISION_WITHDRAWN,
+                withdrawal_batches=[*view.decisions[doc_id].withdrawal_batches, batch_id],
+            )
+            for doc_id in valid
+        }
+        batch = WithdrawalBatch(batch_id, plan.perspective, plan.reason, archived)
+        self.withdrawals[batch_id] = batch
+        for doc_id, decision in archived.items():
+            view.decisions[doc_id] = decision
+        for entry in recheck:
+            doc_id = entry["id"]
+            resolution = self.resolutions[doc_id]
+            self.resolution_history.setdefault(doc_id, []).append(resolution)
+            self.resolutions[doc_id] = replace(
+                resolution,
+                status=RESOLUTION_PENDING_RECHECK,
+                references=[
+                    {
+                        **ref,
+                        "withdrawn_batch": batch_id,
+                        "withdrawn_reason": batch.reason,
+                    }
+                    if ref.get("perspective") == plan.perspective
+                    and ref.get("doc_id", doc_id) in scope
+                    else dict(ref)
+                    for ref in resolution.references
+                ],
+            )
+        plan.status = PLAN_APPLIED
+        plan.batch_id = batch_id
+        plan.applied = {
+            "batch_id": batch_id,
+            "withdrawn": sorted(valid),
+            "skipped": skipped,
+            "recheck_resolutions": sorted(recheck_ids),
+            "supported_resolutions": [entry["id"] for entry in supported],
+        }
+        return plan
+
     # ----------------------------------------------------- merging
     def merge_perspectives(self, names: Optional[Sequence[str]] = None) -> dict:
         """Merge review perspectives without overwriting any judgement.
@@ -769,6 +1194,10 @@ class ResearchSet:
                 batch_id: _withdrawal_payload(batch)
                 for batch_id, batch in self.withdrawals.items()
             },
+            "withdrawal_plans": {
+                plan_id: _plan_payload(plan)
+                for plan_id, plan in self.withdrawal_plans.items()
+            },
         }
 
     def save(self) -> None:
@@ -811,6 +1240,8 @@ class ResearchSet:
             ]
         for batch_id, entry in payload.get("withdrawals", {}).items():
             research.withdrawals[batch_id] = _withdrawal_from_payload(entry)
+        for plan_id, entry in payload.get("withdrawal_plans", {}).items():
+            research.withdrawal_plans[plan_id] = _plan_from_payload(entry)
         return research
 
 
@@ -846,6 +1277,18 @@ class PerspectiveView:
 
     def withdraw_decisions(self, doc_ids: Sequence[str], reason: str) -> WithdrawalBatch:
         return self.research.withdraw_decisions(doc_ids, reason, self.name)
+
+    def plan_withdrawal(
+        self,
+        doc_ids: Sequence[str],
+        reason: str,
+        *,
+        keep: Sequence[str] = (),
+        references: Sequence[str] = (),
+    ) -> WithdrawalPlan:
+        return self.research.plan_withdrawal(
+            doc_ids, reason, self.name, keep=keep, references=references
+        )
 
     def document_payload(self, doc_id: str) -> dict:
         return self.research.document_payload(doc_id, self.name)

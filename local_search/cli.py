@@ -62,6 +62,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     research_resolve.add_argument("doc_id")
     research_resolve.add_argument("action", choices=["included", "excluded"])
     research_resolve.add_argument("reason")
+    research_plan_withdraw = commands.add_parser("research-plan-withdraw")
+    research_plan_withdraw.add_argument("name")
+    research_plan_withdraw.add_argument("doc_ids_json", help='["doc-id-1", "doc-id-2"]')
+    research_plan_withdraw.add_argument("reason")
+    research_plan_withdraw.add_argument("--perspective", required=True)
+    research_plan_withdraw.add_argument("--keep", help='["doc-id", ...] must-keep resolutions')
+    research_plan_withdraw.add_argument("--references", help='["doc-id", ...] cited-only opinions')
+    research_plan_withdraw.add_argument("--plan-id")
+    research_plan_show = commands.add_parser("research-plan-show")
+    research_plan_show.add_argument("name")
+    research_plan_show.add_argument("plan_id")
+    research_plan_apply = commands.add_parser("research-plan-apply")
+    research_plan_apply.add_argument("name")
+    research_plan_apply.add_argument("plan_id")
+    research_plan_cancel = commands.add_parser("research-plan-cancel")
+    research_plan_cancel.add_argument("name")
+    research_plan_cancel.add_argument("plan_id")
     research_continue = commands.add_parser("research-continue")
     research_continue.add_argument("name")
     research_continue.add_argument("--budget", type=int)
@@ -141,6 +158,32 @@ def main(argv: Sequence[str] | None = None) -> None:
         research.resolve(args.doc_id, args.action, args.reason)
         research.save()
         print(json.dumps(research.merge_perspectives(), ensure_ascii=False, indent=2))
+    elif args.command == "research-plan-withdraw":
+        research = engine.open_research_set(args.name)
+        research.add_perspective(args.perspective)
+        plan = research.plan_withdrawal(
+            json.loads(args.doc_ids_json),
+            args.reason,
+            args.perspective,
+            keep=json.loads(args.keep) if args.keep else (),
+            references=json.loads(args.references) if args.references else (),
+            plan_id=args.plan_id,
+        )
+        research.save()
+        print(json.dumps(research.withdrawal_plan_payload(plan.plan_id), ensure_ascii=False, indent=2))
+    elif args.command == "research-plan-show":
+        research = engine.open_research_set(args.name)
+        print(json.dumps(research.withdrawal_plan_payload(args.plan_id), ensure_ascii=False, indent=2))
+    elif args.command == "research-plan-apply":
+        research = engine.open_research_set(args.name)
+        plan = research.apply_withdrawal_plan(args.plan_id)
+        research.save()
+        print(json.dumps(research.withdrawal_plan_payload(plan.plan_id), ensure_ascii=False, indent=2))
+    elif args.command == "research-plan-cancel":
+        research = engine.open_research_set(args.name)
+        plan = research.cancel_withdrawal_plan(args.plan_id)
+        research.save()
+        print(json.dumps(research.withdrawal_plan_payload(plan.plan_id), ensure_ascii=False, indent=2))
     elif args.command == "research-continue":
         research = engine.open_research_set(args.name)
         research.continue_scan(args.budget)

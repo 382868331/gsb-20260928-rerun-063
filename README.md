@@ -170,3 +170,36 @@ python -m local_search.cli --index ./data/index research-merge study
 python -m local_search.cli --index ./data/index research-resolve study d1 excluded "负责人复核"
 python -m local_search.cli --index ./data/index research-withdraw study '["d1","d7"]' "来源复核后撤回" --perspective alice
 ```
+
+## 有依赖关系的多批撤回方案
+
+直接撤回（`withdraw_decisions`）是立即生效的单批操作；撤回方案（withdrawal plan）则把一次撤回拆成"起草 → 预览 → 确认/取消"三步，并在起草时推导依赖：
+
+```python
+alice = research.perspective("alice")
+plan = alice.plan_withdrawal(
+    ["d1", "d7"],
+    "重新核对来源后撤回部分意见",
+    keep=["d3"],          # d3 的已确认裁决必须保持确认
+    references=["d9"],    # 只引用、不撤回 d9 的意见
+)
+plan.report["withdraw"]               # 可行的最小撤回范围
+plan.report["recheck_resolutions"]    # 只依赖被撤意见、将转为待复核的裁决
+plan.report["supported_resolutions"]  # 仍有其他研究者独立支持、保持不变的裁决
+plan.report["unchanged_opinions"]     # 本视角保持不变的意见
+plan.report["conflicts"]              # 与 keep 冲突的依据（不自动覆盖裁决）
+research.save()                        # 方案随研究集持久化，可重开后续核
+research.apply_withdrawal_plan(plan.plan_id)   # 或 research.cancel_withdrawal_plan(...)
+```
+
+- **依赖推导**：裁决的 `references` 可带 `doc_id` 形成跨文档引用。方案推导时，只有当其引用的全部意见都被撤回（或已失效）时才转为 `pending_recheck`；只要仍引用其他研究者的有效意见，就视为有独立支持而保持不变。真正撤回原意见时会扫描全部裁决的跨文档引用，不会遗漏。
+- **引用 ≠ 撤回**：`references` 列出的意见只作为方案依据被引用，应用方案不会触碰原意见；多个批次引用同一份意见时，撤回其中一个引用不会删除原意见。
+- **最小可行范围**：`keep` 指定的已确认裁决必须保持确认。若撤回某意见会使其失去全部支持，该意见被移出撤回范围并记入 `blocked`/`conflicts`（附裁决与引用依据）；完全无法满足时应用阶段直接报冲突中止，绝不自动覆盖裁决。
+- **重开续核**：方案保存后可重新打开再 `apply`。应用时逐条重新核对：已撤回的意见跳过（不重复撤回），制定方案后被改写的新意见按 `opinion_changed_since_plan` 跳过（不混入旧方案）；已应用或已取消的方案不能再次应用。
+
+```bash
+python -m local_search.cli --index ./data/index research-plan-withdraw study '["d1","d7"]' "来源复核" --perspective alice --keep '["d3"]'
+python -m local_search.cli --index ./data/index research-plan-show study plan-1
+python -m local_search.cli --index ./data/index research-plan-apply study plan-1
+python -m local_search.cli --index ./data/index research-plan-cancel study plan-1
+```
