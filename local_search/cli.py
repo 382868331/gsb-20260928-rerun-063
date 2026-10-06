@@ -3,6 +3,7 @@ import json
 from typing import Sequence
 
 from .engine import SearchEngine
+from .research import _plan_payload
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -54,6 +55,37 @@ def main(argv: Sequence[str] | None = None) -> None:
     research_withdraw.add_argument("reason")
     research_withdraw.add_argument("--perspective", required=True)
     research_withdraw.add_argument("--batch-id")
+    research_withdraw_preview = commands.add_parser("research-withdraw-preview")
+    research_withdraw_preview.add_argument("name")
+    research_withdraw_preview.add_argument("reason")
+    research_withdraw_preview.add_argument("--perspective", required=True)
+    research_withdraw_preview.add_argument("--opinion-ids-json", default="[]")
+    research_withdraw_preview.add_argument("--reference-ids-json", default="[]")
+    research_withdraw_preview.add_argument("--retain-resolutions-json", default="[]")
+    research_withdraw_plan = commands.add_parser("research-withdraw-plan")
+    research_withdraw_plan.add_argument("name")
+    research_withdraw_plan.add_argument("reason")
+    research_withdraw_plan.add_argument("--perspective", required=True)
+    research_withdraw_plan.add_argument("--opinion-ids-json", default="[]")
+    research_withdraw_plan.add_argument("--reference-ids-json", default="[]")
+    research_withdraw_plan.add_argument("--retain-resolutions-json", default="[]")
+    research_withdraw_plan.add_argument("--plan-id")
+    research_withdraw_plan_minimal = commands.add_parser("research-withdraw-plan-minimal")
+    research_withdraw_plan_minimal.add_argument("name")
+    research_withdraw_plan_minimal.add_argument("reason")
+    research_withdraw_plan_minimal.add_argument("--perspective", required=True)
+    research_withdraw_plan_minimal.add_argument("--opinion-ids-json")
+    research_withdraw_plan_minimal.add_argument("--retain-resolutions-json", default="[]")
+    research_withdraw_plan_minimal.add_argument("--plan-id")
+    research_withdraw_resume = commands.add_parser("research-withdraw-resume")
+    research_withdraw_resume.add_argument("name")
+    research_withdraw_resume.add_argument("plan_id")
+    research_withdraw_apply = commands.add_parser("research-withdraw-apply")
+    research_withdraw_apply.add_argument("name")
+    research_withdraw_apply.add_argument("plan_id")
+    research_withdraw_cancel = commands.add_parser("research-withdraw-cancel")
+    research_withdraw_cancel.add_argument("name")
+    research_withdraw_cancel.add_argument("plan_id")
     research_merge = commands.add_parser("research-merge")
     research_merge.add_argument("name")
     research_merge.add_argument("--perspective", action="append", dest="perspectives")
@@ -62,6 +94,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     research_resolve.add_argument("doc_id")
     research_resolve.add_argument("action", choices=["included", "excluded"])
     research_resolve.add_argument("reason")
+    research_resolve.add_argument("--support-opinion-ids-json")
     research_continue = commands.add_parser("research-continue")
     research_continue.add_argument("name")
     research_continue.add_argument("--budget", type=int)
@@ -133,12 +166,69 @@ def main(argv: Sequence[str] | None = None) -> None:
             "status": research.review_status(args.perspective),
             "merge": research.merge_perspectives(),
         }, ensure_ascii=False, indent=2))
+    elif args.command == "research-withdraw-preview":
+        research = engine.open_research_set(args.name)
+        research.add_perspective(args.perspective)
+        print(json.dumps(research.preview_withdrawal(
+            args.perspective,
+            args.reason,
+            json.loads(args.opinion_ids_json),
+            json.loads(args.reference_ids_json),
+            json.loads(args.retain_resolutions_json),
+        ), ensure_ascii=False, indent=2))
+    elif args.command == "research-withdraw-plan":
+        research = engine.open_research_set(args.name)
+        research.add_perspective(args.perspective)
+        plan = research.plan_withdrawal(
+            args.perspective,
+            args.reason,
+            json.loads(args.opinion_ids_json),
+            json.loads(args.reference_ids_json),
+            json.loads(args.retain_resolutions_json),
+            plan_id=args.plan_id,
+        )
+        research.save()
+        print(json.dumps(_plan_payload(plan), ensure_ascii=False, indent=2, default=str))
+    elif args.command == "research-withdraw-plan-minimal":
+        research = engine.open_research_set(args.name)
+        research.add_perspective(args.perspective)
+        plan = research.plan_minimal_withdrawal(
+            args.perspective,
+            args.reason,
+            json.loads(args.opinion_ids_json),
+            json.loads(args.retain_resolutions_json),
+            plan_id=args.plan_id,
+        )
+        research.save()
+        print(json.dumps(_plan_payload(plan), ensure_ascii=False, indent=2, default=str))
+    elif args.command == "research-withdraw-resume":
+        research = engine.open_research_set(args.name)
+        print(json.dumps(research.resume_withdrawal_plan(args.plan_id), ensure_ascii=False, indent=2))
+    elif args.command == "research-withdraw-apply":
+        research = engine.open_research_set(args.name)
+        batch = research.apply_withdrawal_plan(args.plan_id)
+        research.save()
+        print(json.dumps({
+            "batch_id": batch.batch_id,
+            "plan": _plan_payload(research.withdrawal_plans[args.plan_id]),
+            "merge": research.merge_perspectives(),
+        }, ensure_ascii=False, indent=2, default=str))
+    elif args.command == "research-withdraw-cancel":
+        research = engine.open_research_set(args.name)
+        research.cancel_withdrawal_plan(args.plan_id)
+        research.save()
+        print(json.dumps(_plan_payload(research.withdrawal_plans[args.plan_id]), ensure_ascii=False, indent=2, default=str))
     elif args.command == "research-merge":
         research = engine.open_research_set(args.name)
         print(json.dumps(research.merge_perspectives(args.perspectives), ensure_ascii=False, indent=2))
     elif args.command == "research-resolve":
         research = engine.open_research_set(args.name)
-        research.resolve(args.doc_id, args.action, args.reason)
+        research.resolve(
+            args.doc_id,
+            args.action,
+            args.reason,
+            json.loads(args.support_opinion_ids_json) if args.support_opinion_ids_json else None,
+        )
         research.save()
         print(json.dumps(research.merge_perspectives(), ensure_ascii=False, indent=2))
     elif args.command == "research-continue":

@@ -147,7 +147,9 @@ report = research.merge_perspectives()
 research.resolve("d1", "excluded", "负责人复核：超出范围")
 ```
 
-研究者可以一次性撤回自己的多条意见，撤回必须填写原因，并且只会撤回指定视角自己的当前意见；其他研究者意见和负责人裁决都不会被删除。撤回的原意见进入撤回批次归档，当前页面与状态不再把它当作有效排除/纳入依据：
+每条审阅意见和负责人裁决引用都有稳定身份（`opinion_id`、`reference_id`）。研究者可以一次性撤回自己的多条原意见，也可以只移除负责人裁决中的某一个引用；撤回必须填写原因，并且只会影响指定视角自己的当前意见或引用。其他研究者意见不会被删除，原意见也不会因为某个批次移除引用而消失。真正撤回原意见时，系统会扫描当前裁决中所有同文档和跨文档引用，再区分后续裁决是否仍有其他研究者的同动作独立支持。
+
+直接撤回一组文档或稳定意见时，被撤回原意见进入撤回批次归档，当前页面与状态不再把它当作有效排除/纳入依据：
 
 ```python
 alice = research.perspective("alice")
@@ -159,7 +161,13 @@ batch.batch_id
 research.save()
 ```
 
-如果负责人历史裁决的 `references` 引用了该批次中的意见，该裁决不会被删除，而是标记为 `pending_recheck`；裁决动作、原因、证据签名和原始引用都继续保留在当前裁决与 `resolution_history` 中。`merge_perspectives()` 会把这类文档归入 `recheck`，`review_status()` 的 `recheck_resolutions` 也会列出待复核清单。负责人完成复核后可再次调用 `resolve()` 写入新裁决，旧裁决仍作为历史依据保留。
+如果负责人历史裁决的引用只依赖这批被撤回支持，该裁决不会被删除或自动改写，而是标记为 `pending_recheck`；仍有其他研究者同动作独立支持的裁决保持有效。裁决动作、原因、证据签名和原始引用都继续保留在当前裁决与 `resolution_history` 中。`merge_perspectives()` 会把待复核文档归入 `recheck`，`review_status()` 的 `recheck_resolutions` 也会列出清单。负责人完成复核后可再次调用 `resolve()` 写入新裁决，旧裁决仍作为历史依据保留。
+
+正式撤回前可先预览依赖推导；`preview_withdrawal()` 返回将转为待复核的裁决、仍有独立支持而保持确认的裁决、完全不变的意见以及每条依赖的引用。`plan_withdrawal()` 会把方案保存为 `draft`，重开后用 `resume_withdrawal_plan()` 继续核对；方案只记住创建时明确选择的稳定意见/引用，之后新增的审阅意见不会混入。`cancel_withdrawal_plan()` 取消且不改变任何意见，`apply_withdrawal_plan()` 在重新校验无重复撤回、无缺失引用后才落批。
+
+可以用 `retain_resolutions` 指定必须保持确认的裁决。`plan_minimal_withdrawal()` 会在可行时把“撤回原意见”缩小为仅移除相关裁决引用；若无法同时满足，会在预览的 `conflicts` 中展示冲突依赖和原因，不会自动覆盖或改判。
+
+跨文档裁决可在 `resolve()` 中通过 `support_opinion_ids` 显式引用其他文档的原意见；这些跨文档引用与同文档引用使用同一套撤回传播规则。
 
 索引更新后，`revise_research_set()`（查询不变时即派生新研究）逐视角继承：内容未变、证据签名仍相符的记录继承原决定（含已读位置，去重且不保留已删除文档）；内容变更的记录进入 `dropped_decisions`（`evidence_basis_changed`），已删除记录标记 `document_absent`，都要求重新审阅。解决决定只有在它引用的全部原判断都仍可用（有效或属于匹配的撤回批次）且证据签名仍相符时才随之继承；引用撤回意见的裁决以 `pending_recheck` 状态继承，无关裁决保持有效。撤回批次会随派生集保存，但影响范围仅限批次内意见和实际引用这些意见的结论。派生后的新研究集可以继续挂视角、再合并。
 
@@ -169,4 +177,11 @@ python -m local_search.cli --index ./data/index research-decide study d1 exclude
 python -m local_search.cli --index ./data/index research-merge study
 python -m local_search.cli --index ./data/index research-resolve study d1 excluded "负责人复核"
 python -m local_search.cli --index ./data/index research-withdraw study '["d1","d7"]' "来源复核后撤回" --perspective alice
+python -m local_search.cli --index ./data/index research-resolve study d2 excluded "跨文档依据" --support-opinion-ids-json '["opinion-3"]'
+python -m local_search.cli --index ./data/index research-withdraw-preview study "来源复核" --perspective alice --opinion-ids-json '["opinion-3"]'
+python -m local_search.cli --index ./data/index research-withdraw-plan study "来源复核" --perspective alice --opinion-ids-json '["opinion-3"]' --retain-resolutions-json '["d2"]'
+python -m local_search.cli --index ./data/index research-withdraw-plan-minimal study "来源复核" --perspective alice --opinion-ids-json '["opinion-3"]' --retain-resolutions-json '["d2"]'
+python -m local_search.cli --index ./data/index research-withdraw-resume study plan-1
+python -m local_search.cli --index ./data/index research-withdraw-apply study plan-1
+python -m local_search.cli --index ./data/index research-withdraw-cancel study plan-1
 ```

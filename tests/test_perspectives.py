@@ -116,7 +116,10 @@ class PerspectiveTest(unittest.TestCase):
         resolution = research.resolve("d1", "excluded", "lead reviewer: out of scope")
         self.assertEqual(resolution.action, "excluded")
         self.assertEqual(
-            resolution.references,
+            [
+                {key: ref[key] for key in ("perspective", "action", "reason")}
+                for ref in resolution.references
+            ],
             [
                 {"perspective": "alice", "action": "included", "reason": "alice: yes"},
                 {"perspective": "bob", "action": "excluded", "reason": "bob: no"},
@@ -195,6 +198,7 @@ class PerspectiveTest(unittest.TestCase):
         old.resolve("d2", "included", "lead: d2")
         old.resolve("d3", "excluded", "lead: d3")
         batch = alice.withdraw_decisions(["d1", "d2"], "alice: withdrawn")
+        alice.plan_withdrawal("unfinished recheck", [old.perspectives["alice"].decisions["d3"].opinion_id])
         old.save()
 
         report = self.engine.revise_research_set("rs", new_name="derived")
@@ -202,6 +206,7 @@ class PerspectiveTest(unittest.TestCase):
         self.assertIn(("d2", True), inherited)
         self.assertIn(("d3", False), inherited)
         derived = self.engine.open_research_set("derived")
+        self.assertEqual(derived.withdrawal_plans, {})
         self.assertIn(batch.batch_id, derived.withdrawals)
         self.assertEqual(
             derived.perspectives["alice"].decisions["d1"].status,
@@ -211,6 +216,147 @@ class PerspectiveTest(unittest.TestCase):
         self.assertEqual(derived.resolutions["d2"].status, "pending_recheck")
         self.assertEqual(derived.resolutions["d3"].status, "active")
         self.assertEqual(derived.resolution_history["d2"][0].references[0]["reason"], "alice: d2")
+
+    def test_removing_one_citation_keeps_original_opinion_and_other_batches(self) -> None:
+        research = self.make_set()
+        alice = research.perspective("alice")
+        bob = research.perspective("bob")
+        alice.decide("d1", "included", "alice: d1 evidence")
+        bob.decide("d1", "excluded", "bob: d1 objection")
+        alice.decide("d2", "included", "alice: independent d2 evidence")
+        bob.decide("d2", "included", "bob: agrees d2")
+        carol = research.perspective("carol")
+        carol.decide("d2", "excluded", "carol: disagrees d2")
+        research.resolve("d2", "included", "lead: cited both batches")
+        first_ref = research.resolutions["d2"].references[0]["reference_id"]
+        alice_opinion = research.perspectives["alice"].decisions["d1"].opinion_id
+
+        research.resolve("d1", "excluded", "lead: plus alice cross-doc", [alice_opinion])
+        preview = research.preview_withdrawal("alice", "alice: only d2 citation was weak", reference_ids=[first_ref])
+        self.assertEqual(preview["pending_recheck"], [])
+        self.assertEqual(preview["kept_with_independent_support"][0]["doc_id"], "d2")
+
+        batch = alice.withdraw_decisions(
+            reason="alice: only d2 citation was weak",
+            reference_ids=[first_ref],
+        )
+        self.assertEqual(alice.document_payload("d2")["review"], "included")
+        self.assertEqual(alice.document_payload("d1")["review"], "included")
+        self.assertEqual(batch.decisions, {})
+        self.assertEqual(batch.removed_references[0]["reference_id"], first_ref)
+        self.assertEqual(research.resolutions["d2"].status, "active")
+        d2_refs = research.resolutions["d2"].references
+        self.assertEqual(d2_refs[0]["status"], "removed")
+        self.assertEqual(d2_refs[1]["status"], "active")
+
+    def test_withdrawing_source_opinion_follows_all_cross_document_citations(self) -> None:
+        research = self.make_set()
+        alice = research.perspective("alice")
+        bob = research.perspective("bob")
+        carol = research.perspective("carol")
+        alice.decide("d1", "included", "alice: source study")
+        bob.decide("d1", "excluded", "bob: objection")
+        bob.decide("d2", "excluded", "bob: d2 objection")
+        carol.decide("d2", "excluded", "carol: independently agrees")
+        bob.decide("d3", "included", "bob: d3 objection disagreement")
+        carol.decide("d3", "excluded", "carol: d3 support")
+        bob.decide("d4", "included", "bob: d4 objection")
+        research.resolve("d2", "excluded", "lead: d2", [])
+        alice_opinion = research.perspectives["alice"].decisions["d1"].opinion_id
+        research.resolve("d3", "excluded", "lead: uses source and carol", [alice_opinion])
+        research.resolve("d4", "excluded", "lead: only source backs this", [alice_opinion])
+
+        batch = alice.withdraw_decisions(
+            reason="alice: source invalid",
+            opinion_ids=[alice_opinion],
+        )
+        self.assertEqual(batch.decisions["d1"].status, "withdrawn")
+        self.assertEqual(research.resolutions["d3"].status, "active")
+        self.assertEqual(research.resolutions["d4"].status, "pending_recheck")
+        self.assertEqual(research.resolutions["d2"].status, "active")
+
+    def test_required_retained_resolution_reports_conflict_without_overwrite(self) -> None:
+        research = self.make_set()
+        alice = research.perspective("alice")
+        bob = research.perspective("bob")
+        alice.decide("d1", "included", "alice: source")
+        bob.decide("d1", "excluded", "bob: no")
+        alice_d1 = research.perspectives["alice"].decisions["d1"].opinion_id
+        research.resolve("d1", "included", "lead: accepts source", [alice_d1])
+        original = research.resolutions["d1"]
+        preview = research.preview_withdrawal(
+            "alice",
+            "source invalid",
+            opinion_ids=[alice_d1],
+            retain_resolutions=["d1"],
+        )
+        self.assertFalse(preview["feasible"])
+        self.assertEqual(preview["conflicts"][0]["doc_id"], "d1")
+        with self.assertRaises(ValueError):
+            alice.withdraw_decisions(
+                reason="source invalid",
+                opinion_ids=[alice_d1],
+                retain_resolutions=["d1"],
+            )
+        self.assertIs(research.resolutions["d1"], original)
+        self.assertEqual(research.resolutions["d1"].status, "active")
+
+    def test_saved_plan_can_cancel_resume_and_ignores_new_opinions(self) -> None:
+        research = self.make_set()
+        alice = research.perspective("alice")
+        bob = research.perspective("bob")
+        alice.decide("d1", "included", "alice: source")
+        bob.decide("d1", "excluded", "bob: no")
+        opinion_id = research.perspectives["alice"].decisions["d1"].opinion_id
+        research.resolve("d1", "excluded", "lead: conflict plus source", [opinion_id])
+        plan = research.plan_withdrawal(
+            "alice",
+            "recheck source",
+            opinion_ids=[opinion_id],
+            plan_id="plan-check",
+        )
+        self.assertIn("pending_recheck", plan.preview)
+        research.save()
+
+        reopened = self.engine.open_research_set("rs")
+        self.assertEqual(reopened.withdrawal_plans["plan-check"].opinion_ids, [opinion_id])
+        reopened.perspective("alice").decide("d2", "included", "new opinion after plan")
+        resumed = reopened.resume_withdrawal_plan("plan-check")
+        self.assertEqual(resumed["warnings"], [])
+        self.assertNotIn(reopened.perspectives["alice"].decisions["d2"].opinion_id, resumed["preview"]["withdraw_opinions"])
+        reopened.cancel_withdrawal_plan("plan-check")
+        reopened.save()
+        cancelled = self.engine.open_research_set("rs")
+        self.assertEqual(cancelled.withdrawal_plans["plan-check"].status, "cancelled")
+        self.assertEqual(cancelled.perspectives["alice"].decisions["d1"].status, "active")
+
+    def test_minimal_plan_removes_citation_instead_of_source_to_retain_resolution(self) -> None:
+        research = self.make_set()
+        alice = research.perspective("alice")
+        bob = research.perspective("bob")
+        carol = research.perspective("carol")
+        alice.decide("d1", "included", "alice: source")
+        bob.decide("d1", "excluded", "bob: no")
+        alice.decide("d2", "included", "alice: d2")
+        bob.decide("d2", "excluded", "bob: d2 objection")
+        carol.decide("d2", "included", "carol: independent d2")
+        research.resolve("d2", "included", "lead: cited both")
+        opinion_id = research.perspectives["alice"].decisions["d2"].opinion_id
+
+        plan = research.plan_minimal_withdrawal(
+            "alice",
+            "source wording wrong",
+            [opinion_id],
+            ["d2"],
+            plan_id="minimal",
+        )
+        self.assertEqual(plan.opinion_ids, [])
+        self.assertEqual(len(plan.reference_ids), 1)
+        self.assertEqual(plan.preview["pending_recheck"], [])
+        batch = research.apply_withdrawal_plan("minimal")
+        self.assertEqual(batch.decisions, {})
+        self.assertEqual(alice.document_payload("d2")["review"], "included")
+        self.assertEqual(research.resolutions["d2"].status, "active")
 
     def test_derive_after_index_update_then_merge(self) -> None:
         old = self.make_set()
